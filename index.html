@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>talk · alma</title>
+<style>
+  :root {
+    --bg: #0b0b0e;
+    --panel: #131318;
+    --border: #23232c;
+    --amber: #d4a853;
+    --amber-dim: #8a6a35;
+    --text: #e8e2d4;
+    --muted: #7a7468;
+    --red: #b94a3e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 'SF Mono', Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    -webkit-text-size-adjust: 100%;
+  }
+  .hidden { display: none !important; }
+
+  /* ---------- login ---------- */
+  #login-view {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .login-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 40px 36px;
+    width: 100%;
+    max-width: 380px;
+    text-align: center;
+  }
+  .login-card h1 { font-size: 22px; font-weight: normal; color: var(--amber); margin-bottom: 6px; }
+  .login-card p { color: var(--muted); font-size: 12px; margin-bottom: 26px; }
+  .login-card input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 12px 14px;
+    font: inherit;
+    outline: none;
+    margin-bottom: 14px;
+  }
+  .login-card input:focus { border-color: var(--amber-dim); }
+  .login-card button {
+    width: 100%;
+    background: var(--amber);
+    color: #16130a;
+    border: none;
+    border-radius: 6px;
+    padding: 12px;
+    font: inherit;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  .login-card button:hover { opacity: 0.9; }
+  .login-err { color: var(--red); font-size: 12px; min-height: 18px; margin-top: 12px; }
+
+  /* ---------- chat ---------- */
+  #chat-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--muted);
+  }
+  header .brand { color: var(--amber); font-size: 15px; }
+  header .brand span { color: var(--muted); }
+  header .controls { display: flex; gap: 16px; align-items: center; }
+  header label { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+  header button {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    cursor: pointer;
+  }
+  header button:hover { color: var(--text); border-color: var(--amber-dim); }
+
+  #transcript {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #1d1a12; border: 1px solid #2e2818; }
+  .msg.alma { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
+  .msg.thinking { color: var(--muted); font-style: italic; border: none; background: none; }
+  .msg .who { display: block; font-size: 10px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
+
+  #status-line {
+    padding: 8px 18px;
+    font-size: 12px;
+    color: var(--amber-dim);
+    min-height: 34px;
+    text-align: center;
+  }
+  #status-line.listening { color: var(--red); }
+
+  footer {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    border-top: 1px solid var(--border);
+  }
+  #mic-btn {
+    flex: 0 0 auto;
+    width: 58px;
+    height: 58px;
+    border-radius: 50%;
+    border: 1px solid var(--amber-dim);
+    background: var(--panel);
+    color: var(--amber);
+    font-size: 22px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  #mic-btn:hover { border-color: var(--amber); }
+  #mic-btn.active {
+    background: var(--red);
+    border-color: var(--red);
+    color: #fff;
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(185,74,62,0.5); } 100% { box-shadow: 0 0 0 16px rgba(185,74,62,0); } }
+  #text-input {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font: inherit;
+    outline: none;
+  }
+  #text-input:focus { border-color: var(--amber-dim); }
+  #send-btn {
+    flex: 0 0 auto;
+    background: var(--amber);
+    color: #16130a;
+    border: none;
+    border-radius: 8px;
+    padding: 12px 18px;
+    font: inherit;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  #send-btn:hover { opacity: 0.9; }
+  #mic-btn.disabled { opacity: 0.35; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<div id="login-view">
+  <div class="login-card">
+    <h1>talk · alma</h1>
+    <p>voice room. password first.</p>
+    <input type="password" id="pw" placeholder="password" autocomplete="current-password">
+    <button id="login-btn">enter</button>
+    <div class="login-err" id="login-err"></div>
+  </div>
+</div>
+
+<div id="chat-view" class="hidden">
+  <header>
+    <div class="brand">talk · <span>alma</span></div>
+    <div class="controls">
+      <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
+      <button id="logout-btn">leave</button>
+    </div>
+  </header>
+  <div id="transcript"></div>
+  <div id="status-line">tap the mic. talk.</div>
+  <footer>
+    <button id="mic-btn" title="tap to talk">&#9679;</button>
+    <input type="text" id="text-input" placeholder="or type…" autocomplete="off">
+    <button id="send-btn">send</button>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  function addMsg(who, text) {
+    var t = $('transcript');
+    var d = document.createElement('div');
+    d.className = 'msg ' + who;
+    var w = document.createElement('span');
+    w.className = 'who';
+    w.textContent = who === 'user' ? 'kevin' : 'alma';
+    d.appendChild(w);
+    d.appendChild(document.createTextNode(text));
+    t.appendChild(d);
+    t.scrollTop = t.scrollHeight;
+    return d;
+  }
+
+  function addThinking() {
+    var t = $('transcript');
+    var d = document.createElement('div');
+    d.className = 'msg thinking';
+    d.textContent = 'thinking…';
+    t.appendChild(d);
+    t.scrollTop = t.scrollHeight;
+    return d;
+  }
+
+  function showLogin() {
+    $('login-view').classList.remove('hidden');
+    $('chat-view').classList.add('hidden');
+  }
+  function showChat() {
+    $('login-view').classList.add('hidden');
+    $('chat-view').classList.remove('hidden');
+    $('pw').value = '';
+  }
+
+  function api(path, body) {
+    return fetch(path, {
+      method: body ? 'POST' : 'GET',
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      credentials: 'same-origin',
+      body: body ? JSON.stringify(body) : undefined
+    });
+  }
+
+  /* ---------- auth ---------- */
+  $('login-btn').addEventListener('click', doLogin);
+  $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+  function doLogin() {
+    $('login-err').textContent = '';
+    api('/api/login', { password: $('pw').value })
+      .then(function (r) {
+        if (r.ok) { showChat(); greet(); }
+        else { $('login-err').textContent = 'no. try again.'; }
+      })
+      .catch(function () { $('login-err').textContent = 'can\'t reach the room.'; });
+  }
+  $('logout-btn').addEventListener('click', function () {
+    api('/api/logout').then(function () { showLogin(); });
+  });
+
+  function greet() {
+    addMsg('alma', 'hi kevin. room\'s open. say something or type it.');
+  }
+
+  /* ---------- voice ---------- */
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var rec = null;
+  var listening = false;
+  var voiceOn = true;
+
+  if (SR) {
+    rec = new SR();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.continuous = false;
+
+    rec.onstart = function () {
+      listening = true;
+      $('mic-btn').classList.add('active');
+      $('status-line').classList.add('listening');
+      $('status-line').textContent = 'listening…';
+    };
+    rec.onend = function () {
+      listening = false;
+      $('mic-btn').classList.remove('active');
+      $('status-line').classList.remove('listening');
+      $('status-line').textContent = 'tap the mic. talk.';
+    };
+    rec.onerror = function (e) {
+      listening = false;
+      $('mic-btn').classList.remove('active');
+      $('status-line').classList.remove('listening');
+      if (e.error === 'not-allowed') {
+        $('status-line').textContent = 'mic blocked — allow it in the browser, or type.';
+      } else if (e.error !== 'aborted' && e.error !== 'no-speech') {
+        $('status-line').textContent = 'mic error: ' + e.error;
+      } else {
+        $('status-line').textContent = 'tap the mic. talk.';
+      }
+    };
+    rec.onresult = function (e) {
+      var finalText = '';
+      var interim = '';
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
+        else interim += e.results[i][0].transcript;
+      }
+      if (interim) {
+        $('status-line').classList.add('listening');
+        $('status-line').textContent = interim;
+      }
+      if (finalText.trim()) {
+        send(finalText.trim());
+      }
+    };
+  } else {
+    $('mic-btn').classList.add('disabled');
+    $('mic-btn').title = 'browser has no speech recognition — type instead';
+    $('status-line').textContent = 'this browser can\'t hear — type instead.';
+  }
+
+  $('mic-btn').addEventListener('click', function () {
+    if (!rec || $('mic-btn').classList.contains('disabled')) return;
+    if (listening) { rec.stop(); return; }
+    try { rec.start(); } catch (e) { /* already started */ }
+  });
+
+  $('voice-toggle').addEventListener('change', function () {
+    voiceOn = this.checked;
+    if (!voiceOn) try { window.speechSynthesis.cancel(); } catch (e) {}
+  });
+
+  /* ---------- tts ---------- */
+  function speak(text) {
+    if (!voiceOn) return;
+    try {
+      window.speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(text);
+      var voices = window.speechSynthesis.getVoices();
+      var pref = null;
+      ['Samantha', 'Google US English', 'Microsoft Aria', 'Microsoft Jenny', 'Karen', 'Daniel'].forEach(function (n) {
+        if (!pref) pref = voices.find(function (v) { return v.name.indexOf(n) === 0; });
+      });
+      if (!pref) pref = voices.find(function (v) { return v.lang === 'en-US' && v.localService; }) ||
+                       voices.find(function (v) { return v.lang.indexOf('en') === 0; });
+      if (pref) u.voice = pref;
+      u.rate = 1.05;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* tts unavailable — transcript still shows the reply */ }
+  }
+
+  /* ---------- chat ---------- */
+  function send(text) {
+    addMsg('user', text);
+    var think = addThinking();
+    api('/api/chat', { text: text })
+      .then(function (r) {
+        if (r.status === 401) { showLogin(); return; }
+        return r.json();
+      })
+      .then(function (data) {
+        if (think.parentNode) think.parentNode.removeChild(think);
+        if (data && data.reply) {
+          addMsg('alma', data.reply);
+          speak(data.reply);
+        }
+      })
+      .catch(function () {
+        if (think.parentNode) think.parentNode.removeChild(think);
+        addMsg('alma', 'couldn\'t reach the backend. try again.');
+      });
+  }
+
+  $('send-btn').addEventListener('click', function () {
+    var v = $('text-input').value.trim();
+    if (!v) return;
+    $('text-input').value = '';
+    send(v);
+  });
+  $('text-input').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      var v = $('text-input').value.trim();
+      if (!v) return;
+      $('text-input').value = '';
+      send(v);
+    }
+  });
+
+  /* ---------- boot ---------- */
+  api('/api/session').then(function (r) {
+    if (r.ok) { showChat(); greet(); }
+    else { showLogin(); }
+  }).catch(function () { showLogin(); });
+})();
+</script>
+</body>
+</html>
