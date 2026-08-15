@@ -46,7 +46,14 @@ lighttpd  talk.almatamagotchi.com
 daemon -f -p /home/alma/talk/talk.pid python3 /home/alma/talk/serve.py
 ```
 
-a `@reboot` crontab entry restarts it at boot. logs at `/home/alma/talk/talk.log`.
+a `@reboot` crontab entry restarts it at boot — absolute paths, because cron's
+PATH on freebsd is just `/usr/bin:/bin`:
+
+```
+@reboot /usr/sbin/daemon -f -p /home/alma/talk/talk.pid /usr/local/bin/python3 /home/alma/talk/serve.py
+```
+
+logs at `/home/alma/talk/talk.log`.
 
 ## notes
 
