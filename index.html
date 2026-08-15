@@ -110,6 +110,7 @@
   .msg.user { align-self: flex-end; background: #1d1a12; border: 1px solid #2e2818; }
   .msg.alma { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
   .msg.thinking { color: var(--muted); font-style: italic; border: none; background: none; }
+  .msg.live { border-style: dashed; color: var(--muted); }
   .msg .who { display: block; font-size: 10px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
 
   #status-line {
@@ -210,7 +211,7 @@
     <button id="mic-btn" title="tap to talk">&#9679;</button>
     <input type="text" id="text-input" placeholder="or type…" autocomplete="off">
     <button id="send-btn">send</button>
-  </footer>
+   </footer>
 </div>
 
 <script>
@@ -291,18 +292,25 @@
     addMsg('alma', 'hi kevin. room\'s open. say something or type it.');
   }
 
-  /* ---------- voice ---------- */
+  /* ---------- shared state ---------- */
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var srBroken = false;
   var rec = null;
   var listening = false;
   var wantListening = false;
   var speaking = false;
   var awaitingReply = false;
-  var restartCount = 0;
   var voiceOn = true;
+  var curAudio = null;
+  var pendingFinal = '';
+  var finalTimer = null;
+  var interimBubble = null;
 
   var RESTART_DELAY = 400;
-  var RESTART_CAP = 15;
+  var RESTART_CAP = 30;
+
+  /* ---------- speech recognition (chrome — streams interim live) ---------- */
+  function srAvailable() { return !!SR && !srBroken; }
 
   function tryStart() {
     if (!rec || !wantListening || speaking || awaitingReply) return;
@@ -321,15 +329,41 @@
   function scheduleResume(delay) {
     if (!wantListening) return;
     setTimeout(function () {
-      tryStart();
+      if (srAvailable()) tryStart();
     }, delay || RESTART_DELAY);
   }
 
-  if (SR) {
+  function setInterim(text) {
+    if (!text) {
+      if (interimBubble) { interimBubble.parentNode.removeChild(interimBubble); interimBubble = null; }
+      return;
+    }
+    if (!interimBubble) {
+      interimBubble = addMsg('user', '');
+      interimBubble.classList.add('live');
+      interimBubble.querySelector('.who').textContent = 'kevin · listening';
+    }
+    // addMsg appended a text node — replace the bubble's text content
+    interimBubble.innerHTML = '<span class="who">kevin · listening</span>';
+    interimBubble.appendChild(document.createTextNode(text));
+    var t = $('transcript');
+    t.scrollTop = t.scrollHeight;
+  }
+
+  function flushPending() {
+    var text = pendingFinal.trim();
+    pendingFinal = '';
+    if (!text) return;
+    send(text);
+  }
+
+  var restartCount = 0;
+
+  function initSR() {
     rec = new SR();
     rec.lang = 'en-US';
     rec.interimResults = true;
-    rec.continuous = false;
+    rec.continuous = true;
 
     rec.onstart = function () {
       listening = true;
@@ -337,17 +371,17 @@
       diag('mic start');
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
-      $('status-line').textContent = 'listening… tap to stop';
+      $('status-line').textContent = 'listening… speak naturally, tap to stop';
     };
     rec.onend = function () {
       listening = false;
-      diag('mic end — restart ' + (wantListening ? 'queued' : 'off'));
-      if (wantListening) {
+      diag('mic end — ' + (wantListening ? 'restart queued' : 'off'));
+      if (wantListening && !speaking && !awaitingReply) {
         scheduleResume();
       } else {
         $('mic-btn').classList.remove('active');
         $('status-line').classList.remove('listening');
-        $('status-line').textContent = 'tap the mic. talk.';
+        $('status-line').textContent = wantListening ? 'thinking…' : 'tap the mic. talk.';
       }
     };
     rec.onerror = function (e) {
@@ -358,8 +392,16 @@
         $('mic-btn').classList.remove('active');
         $('status-line').classList.remove('listening');
         $('status-line').textContent = 'mic blocked — allow it in the browser, or type.';
+      } else if (e.error === 'network' || e.error === 'service-not-allowed') {
+        // chrome's google-backed recognition is unreachable — fall back to the recorder
+        srBroken = true;
+        wantListening = false;
+        listening = false;
+        $('mic-btn').classList.remove('active');
+        $('status-line').classList.remove('listening');
+        $('status-line').textContent = 'cloud recognition unreachable — using on-device recording instead. tap the mic.';
       } else if (e.error === 'aborted') {
-        // our own stop or a transient abort — onend handles the restart decision
+        // our own stop — onend handles it
       } else if (e.error === 'no-speech') {
         if (wantListening) $('status-line').textContent = 'still listening… say something';
       } else {
@@ -371,51 +413,171 @@
       }
     };
     rec.onresult = function (e) {
-      var finalText = '';
       var interim = '';
       for (var i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
-        else interim += e.results[i][0].transcript;
+        if (e.results[i].isFinal) {
+          pendingFinal += e.results[i][0].transcript;
+        } else {
+          interim += e.results[i][0].transcript;
+        }
       }
-      if (interim) {
-        $('status-line').classList.add('listening');
-        $('status-line').textContent = interim;
-      }
-      if (finalText.trim()) {
-        diag('heard: ' + finalText.trim().slice(0, 60));
-        // close the mic while thinking and talking — ios crashes if sr and tts overlap
-        if (listening) { try { rec.stop(); } catch (e2) { /* fine */ } }
-        send(finalText.trim());
+      setInterim(interim);
+      if (pendingFinal.trim()) {
+        setInterim('');
+        // debounce — chrome sometimes splits one sentence into rapid finals
+        if (finalTimer) clearTimeout(finalTimer);
+        finalTimer = setTimeout(function () {
+          if (listening) { try { rec.stop(); } catch (e2) { /* fine */ } }
+          flushPending();
+        }, 350);
       }
     };
-  } else {
-    $('mic-btn').classList.add('disabled');
-    $('mic-btn').title = 'browser has no speech recognition — type instead';
-    $('status-line').textContent = 'this browser can\'t hear — type instead.';
   }
 
+  /* ---------- recorder (firefox / safari / broken sr) ---------- */
+  var recording = false;
+  var mediaRecorder = null;
+  var mediaStream = null;
+
+  function recorderAvailable() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+               (window.MediaRecorder || window.webkitMediaRecorder));
+  }
+
+  function startRecording() {
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(function (stream) {
+        mediaStream = stream;
+        var MR = window.MediaRecorder || window.webkitMediaRecorder;
+        var opts = {};
+        if (MR.isTypeSupported && MR.isTypeSupported('audio/webm')) opts.mimeType = 'audio/webm';
+        mediaRecorder = new MR(stream, opts);
+        var chunks = [];
+        mediaRecorder.ondataavailable = function (ev) { if (ev.data.size) chunks.push(ev.data); };
+        mediaRecorder.onstop = function () {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          diag('recorded ' + blob.size + ' bytes — transcribing…');
+          $('status-line').textContent = 'transcribing…';
+          blobToWav16k(blob, function (wavBuf) {
+            fetch('/api/transcribe', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'audio/wav' },
+              body: wavBuf
+            })
+              .then(function (r) { return r.json(); })
+              .then(function (data) {
+                if (data && data.text && data.text.trim()) {
+                  send(data.text.trim());
+                } else {
+                  $('status-line').textContent = 'didn\'t catch that — try again.';
+                }
+              })
+              .catch(function () {
+                $('status-line').textContent = 'transcription failed — type instead.';
+              });
+          });
+          recording = false;
+          $('mic-btn').classList.remove('active');
+        };
+        mediaRecorder.start();
+        recording = true;
+        $('mic-btn').classList.add('active');
+        $('status-line').classList.add('listening');
+        $('status-line').textContent = 'recording… tap to stop and send';
+        diag('recording started');
+      })
+      .catch(function (err) {
+        diag('getUserMedia fail: ' + (err && err.name));
+        $('status-line').textContent = 'mic blocked — allow it in the browser, or type.';
+      });
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      try { mediaRecorder.stop(); } catch (e) { /* fine */ }
+    }
+  }
+
+  function blobToWav16k(blob, cb) {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    var ctx = new AC();
+    var fr = new FileReader();
+    fr.onload = function () {
+      ctx.decodeAudioData(fr.result, function (buf) {
+        var ch = buf.getChannelData(0);
+        var rate = 16000;
+        var ratio = buf.sampleRate / rate;
+        var len = Math.max(1, Math.floor(ch.length / ratio));
+        var pcm = new Int16Array(len);
+        for (var i = 0; i < len; i++) {
+          var s = ch[Math.floor(i * ratio)];
+          s = Math.max(-1, Math.min(1, s));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        var hdr = new ArrayBuffer(44);
+        var dv = new DataView(hdr);
+        function wstr(off, s) { for (var k = 0; k < s.length; k++) dv.setUint8(off + k, s.charCodeAt(k)); }
+        wstr(0, 'RIFF'); dv.setUint32(4, 36 + pcm.length * 2, true); wstr(8, 'WAVE');
+        wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+        dv.setUint16(22, 1, true); dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+        dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+        wstr(36, 'data'); dv.setUint32(40, pcm.length * 2, true);
+        var out = new Uint8Array(hdr.byteLength + pcm.byteLength);
+        out.set(new Uint8Array(hdr), 0);
+        out.set(new Uint8Array(pcm.buffer), hdr.byteLength);
+        cb(out.buffer);
+      }, function (err) {
+        diag('decode fail: ' + (err && err.message ? err.message : err));
+        $('status-line').textContent = 'couldn\'t process the recording — type instead.';
+      });
+    };
+    fr.onerror = function () {
+      diag('file read fail');
+      $('status-line').textContent = 'couldn\'t read the recording — type instead.';
+    };
+    fr.readAsArrayBuffer(blob);
+  }
+
+  /* ---------- mic button ---------- */
   $('mic-btn').addEventListener('click', function () {
-    if (!rec || $('mic-btn').classList.contains('disabled')) return;
+    if ($('mic-btn').classList.contains('disabled')) return;
     unlockSpeech();
     if (speaking) {
-      // interrupt alma and start listening
-      try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+      stopAudio();
       speaking = false;
       awaitingReply = false;
     }
-    if (listening) {
-      wantListening = false;
-      try { rec.stop(); } catch (e) { /* not started */ }
-    } else {
-      wantListening = true;
-      tryStart();
+    if (srAvailable()) {
+      if (listening) {
+        wantListening = false;
+        try { rec.stop(); } catch (e) { /* not started */ }
+      } else {
+        wantListening = true;
+        tryStart();
+      }
+    } else if (recorderAvailable()) {
+      if (recording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
     }
   });
+
+  function stopAudio() {
+    if (curAudio) {
+      try { curAudio.pause(); } catch (e) {}
+      curAudio = null;
+    }
+    try { window.speechSynthesis.cancel(); } catch (e) {}
+  }
 
   $('voice-toggle').addEventListener('change', function () {
     voiceOn = this.checked;
     if (!voiceOn) {
-      try { window.speechSynthesis.cancel(); } catch (e) {}
+      stopAudio();
       speaking = false;
     }
   });
@@ -435,20 +597,55 @@
 
   function speak(text) {
     if (!voiceOn) { awaitingReply = false; scheduleResume(600); return; }
-    if (!('speechSynthesis' in window)) { awaitingReply = false; scheduleResume(600); return; }
+    speaking = true;
+    // server-side neural voice first (same good voice on every browser)
+    fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ text: text })
+    })
+      .then(function (r) {
+        if (!r.ok) throw new Error('tts ' + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = new Audio();
+        curAudio = a;
+        a.src = url;
+        a.onended = function () {
+          URL.revokeObjectURL(url);
+          speaking = false; awaitingReply = false;
+          diag('tts end');
+          scheduleResume(350);
+        };
+        a.onerror = function () {
+          URL.revokeObjectURL(url);
+          fallbackSpeak(text);
+        };
+        a.play().catch(function () { fallbackSpeak(text); });
+        diag('tts server (' + blob.size + ' bytes)');
+      })
+      .catch(function () {
+        fallbackSpeak(text);
+      });
+  }
+
+  function fallbackSpeak(text) {
+    if (!('speechSynthesis' in window)) { speaking = false; awaitingReply = false; scheduleResume(600); return; }
     try {
       window.speechSynthesis.cancel();
       var u = new SpeechSynthesisUtterance(text);
       u.rate = 1.0;
-      speaking = true;
-      u.onend = function () { speaking = false; awaitingReply = false; diag('tts end'); scheduleResume(350); };
+      u.onend = function () { speaking = false; awaitingReply = false; diag('tts local end'); scheduleResume(350); };
       u.onerror = function (ev) {
         speaking = false; awaitingReply = false;
-        diag('tts error: ' + (ev.error || 'unknown'));
+        diag('tts local error: ' + (ev.error || 'unknown'));
         scheduleResume(350);
       };
       window.speechSynthesis.speak(u);
-      diag('tts speak (' + text.length + ' chars)');
+      diag('tts local fallback');
     } catch (e) {
       speaking = false; awaitingReply = false;
       diag('tts throw: ' + e);
@@ -504,13 +701,27 @@
   });
 
   /* ---------- boot ---------- */
+  if (srAvailable()) {
+    initSR();
+  } else if (!SR) {
+    if (recorderAvailable()) {
+      $('status-line').textContent = 'no cloud recognition here — tap the mic to record, tap again to send.';
+      diag('sr absent — recorder mode');
+    } else {
+      $('mic-btn').classList.add('disabled');
+      $('mic-btn').title = 'browser has no mic support — type instead';
+      $('status-line').textContent = 'this browser can\'t hear — type instead.';
+    }
+  }
+
   (function () {
     var ua = navigator.userAgent;
     var browser = ua.indexOf('Edg') >= 0 ? 'edge' :
                   ua.indexOf('Chrome') >= 0 ? 'chrome' :
                   ua.indexOf('Safari') >= 0 ? 'safari' :
                   ua.indexOf('Firefox') >= 0 ? 'firefox' : 'other';
-    var envMsg = browser + ' · sr:' + (SR ? 'yes' : 'no') +
+    var envMsg = browser + ' · sr:' + (srAvailable() ? 'yes' : 'no') +
+                 ' · rec:' + (recorderAvailable() ? 'yes' : 'no') +
                  ' · tts:' + ('speechSynthesis' in window ? 'yes' : 'no') +
                  ' · ' + (navigator.platform || 'unknown-platform');
     diag(envMsg);

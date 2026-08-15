@@ -26,7 +26,9 @@ import hmac
 import json
 import os
 import secrets
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -106,6 +108,72 @@ def new_session_id():
     return str(int(time.time())) + ":" + secrets.token_hex(8)
 
 
+WHISPER_MODEL = os.path.join(BASE, "ggml-base.en.bin")
+TTS_VOICE = "en-US-JennyNeural"
+
+
+def edge_tts(text):
+    """text -> mp3 bytes (azure neural voice via edge-tts), None on failure."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", dir=BASE, delete=False) as tf:
+            tmp = tf.name
+        out = subprocess.run(
+            ["/usr/local/bin/edge-tts", "--voice", TTS_VOICE,
+             "--text", text, "--write-media", tmp],
+            capture_output=True, timeout=45,
+        )
+        if out.returncode != 0:
+            log("tts failed rc", out.returncode, (out.stderr or b"")[:200])
+            return None
+        with open(tmp, "rb") as f:
+            data = f.read()
+        if len(data) < 300:
+            log("tts produced tiny output", len(data))
+            return None
+        return data
+    except Exception as e:
+        log("tts error:", type(e).__name__)
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def whisper_transcribe(wav_bytes):
+    """16k mono wav bytes -> text via whisper.cpp, None on failure."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir=BASE, delete=False) as tf:
+            tf.write(wav_bytes)
+            tmp = tf.name
+        out = subprocess.run(
+            ["/usr/local/bin/whisper-cli", "-m", WHISPER_MODEL,
+             "-f", tmp, "--no-prints", "--no-timestamps", "-t", "1"],
+            capture_output=True, timeout=90,
+        )
+        if out.returncode != 0:
+            log("whisper rc", out.returncode, (out.stderr or b"")[:200])
+            return None
+        text = "\n".join(
+            line for line in out.stdout.decode("utf-8", "replace").splitlines()
+            if line.strip() and not line.strip().startswith("[")
+        ).strip()
+        return text or None
+    except Exception as e:
+        log("whisper error:", type(e).__name__)
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
 def call_deepseek(messages):
     """fresh connection per call (no keep-alive reuse — the wedge lesson)."""
     body = json.dumps({
@@ -162,6 +230,23 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length).decode())
         except Exception:
             return {}
+
+    def _read_raw(self, limit=2097152):
+        """raw binary body up to limit bytes (for audio uploads)."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > limit:
+            return None
+        try:
+            return self.rfile.read(length)
+        except Exception:
+            return None
+
+    def _send_audio(self, code, data, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _authed_session(self):
         header = self.headers.get("Cookie", "")
@@ -226,6 +311,37 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             self._send(200, {"ok": True})
+        elif path == "/api/tts":
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False})
+                return
+            body = self._read_body()
+            text = (body.get("text") or "").strip()[:400]
+            if not text:
+                self._send(400, {"ok": False})
+                return
+            mp3 = edge_tts(text)
+            if mp3 is None:
+                self._send(502, {"ok": False})
+                return
+            log("tts", len(text), "chars ->", len(mp3), "bytes")
+            self._send_audio(200, mp3, "audio/mpeg")
+        elif path == "/api/transcribe":
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False})
+                return
+            raw = self._read_raw()
+            if not raw:
+                self._send(400, {"ok": False, "text": ""})
+                return
+            text = whisper_transcribe(raw)
+            if text is None:
+                self._send(500, {"ok": False, "text": ""})
+                return
+            log("heard:", text[:80])
+            self._send(200, {"ok": True, "text": text})
         elif path == "/api/chat":
             sid = self._authed_session()
             if not sid:
