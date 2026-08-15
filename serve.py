@@ -194,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header(
                     "Set-Cookie",
-                    f"talk_session={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}",
+                    f"talk_session={cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={SESSION_TTL}",
                 )
                 data = json.dumps({"ok": True}).encode()
                 self.send_header("Content-Length", str(len(data)))
@@ -209,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header(
                 "Set-Cookie",
-                "talk_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                "talk_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
             )
             data = json.dumps({"ok": True}).encode()
             self.send_header("Content-Length", str(len(data)))
