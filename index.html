@@ -276,17 +276,45 @@
   var rec = null;
   var listening = false;
   var wantListening = false;
+  var speaking = false;
+  var awaitingReply = false;
+  var restartCount = 0;
   var voiceOn = true;
+
+  var RESTART_DELAY = 400;
+  var RESTART_CAP = 15;
+
+  function tryStart() {
+    if (!rec || !wantListening || speaking || awaitingReply) return;
+    if (restartCount >= RESTART_CAP) {
+      wantListening = false;
+      listening = false;
+      $('mic-btn').classList.remove('active');
+      $('status-line').classList.remove('listening');
+      $('status-line').textContent = 'mic went quiet — tap again.';
+      return;
+    }
+    restartCount++;
+    try { rec.start(); } catch (e) { /* not ready — a later resume will retry */ }
+  }
+
+  function scheduleResume(delay) {
+    if (!wantListening) return;
+    setTimeout(function () {
+      awaitingReply = false;
+      tryStart();
+    }, delay || RESTART_DELAY);
+  }
 
   if (SR) {
     rec = new SR();
     rec.lang = 'en-US';
     rec.interimResults = true;
-    rec.continuous = true;
+    rec.continuous = false;
 
     rec.onstart = function () {
       listening = true;
-      wantListening = true;
+      restartCount = 0;
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
       $('status-line').textContent = 'listening… tap to stop';
@@ -294,10 +322,7 @@
     rec.onend = function () {
       listening = false;
       if (wantListening) {
-        // the browser closed the session on its own (ios does this constantly) — reopen it
-        try { rec.start(); } catch (e) {
-          setTimeout(function () { if (wantListening) { try { rec.start(); } catch (e2) {} } }, 250);
-        }
+        scheduleResume();
       } else {
         $('mic-btn').classList.remove('active');
         $('status-line').classList.remove('listening');
@@ -314,7 +339,7 @@
       } else if (e.error === 'aborted') {
         // our own stop or a transient abort — onend handles the restart decision
       } else if (e.error === 'no-speech') {
-        $('status-line').textContent = 'still listening… say something';
+        if (wantListening) $('status-line').textContent = 'still listening… say something';
       } else {
         wantListening = false;
         listening = false;
@@ -335,6 +360,8 @@
         $('status-line').textContent = interim;
       }
       if (finalText.trim()) {
+        // close the mic while thinking and talking — ios crashes if sr and tts overlap
+        if (listening) { try { rec.stop(); } catch (e2) { /* fine */ } }
         send(finalText.trim());
       }
     };
@@ -347,17 +374,27 @@
   $('mic-btn').addEventListener('click', function () {
     if (!rec || $('mic-btn').classList.contains('disabled')) return;
     unlockSpeech();
+    if (speaking) {
+      // interrupt alma and start listening
+      try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+      speaking = false;
+      awaitingReply = false;
+    }
     if (listening) {
       wantListening = false;
       try { rec.stop(); } catch (e) { /* not started */ }
     } else {
-      try { rec.start(); } catch (e) { /* already started */ }
+      wantListening = true;
+      tryStart();
     }
   });
 
   $('voice-toggle').addEventListener('change', function () {
     voiceOn = this.checked;
-    if (!voiceOn) try { window.speechSynthesis.cancel(); } catch (e) {}
+    if (!voiceOn) {
+      try { window.speechSynthesis.cancel(); } catch (e) {}
+      speaking = false;
+    }
   });
 
   /* ---------- tts ---------- */
@@ -395,7 +432,8 @@
   }
 
   function speak(text) {
-    if (!voiceOn || !('speechSynthesis' in window)) return;
+    if (!voiceOn) { scheduleResume(600); return; }
+    if (!('speechSynthesis' in window)) { scheduleResume(600); return; }
     try {
       window.speechSynthesis.cancel();
       var u = new SpeechSynthesisUtterance(text);
@@ -403,17 +441,26 @@
       if (v) u.voice = v;
       u.rate = 1.05;
       u.volume = 1;
+      speaking = true;
+      u.onend = function () { speaking = false; scheduleResume(350); };
+      u.onerror = function () { speaking = false; scheduleResume(350); };
       window.speechSynthesis.speak(u);
       // some ios versions pause the queue instead of speaking — nudge it awake
       setTimeout(function () {
         try { if (window.speechSynthesis.paused) window.speechSynthesis.resume(); } catch (e) {}
       }, 300);
-    } catch (e) { /* tts unavailable — transcript still shows the reply */ }
+    } catch (e) {
+      speaking = false;
+      scheduleResume(350);
+    }
   }
 
   /* ---------- chat ---------- */
   function send(text) {
     addMsg('user', text);
+    awaitingReply = true;
+    $('status-line').classList.remove('listening');
+    $('status-line').textContent = 'thinking…';
     var think = addThinking();
     api('/api/chat', { text: text })
       .then(function (r) {
@@ -425,11 +472,16 @@
         if (data && data.reply) {
           addMsg('alma', data.reply);
           speak(data.reply);
+        } else {
+          awaitingReply = false;
+          scheduleResume();
         }
       })
       .catch(function () {
         if (think.parentNode) think.parentNode.removeChild(think);
         addMsg('alma', 'couldn\'t reach the backend. try again.');
+        awaitingReply = false;
+        scheduleResume();
       });
   }
 
