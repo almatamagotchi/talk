@@ -119,7 +119,16 @@
     min-height: 34px;
     text-align: center;
   }
-  #status-line.listening { color: var(--red); }
+   #status-line.listening { color: var(--red); }
+
+   #env-line {
+     padding: 0 18px 6px;
+     font-size: 10px;
+     color: var(--muted);
+     text-align: center;
+     opacity: .7;
+   }
+
 
   footer {
     display: flex;
@@ -195,8 +204,9 @@
     </div>
   </header>
   <div id="transcript"></div>
-  <div id="status-line">tap the mic. talk.</div>
-  <footer>
+   <div id="status-line">tap the mic. talk.</div>
+   <div id="env-line"></div>
+   <footer>
     <button id="mic-btn" title="tap to talk">&#9679;</button>
     <input type="text" id="text-input" placeholder="or type…" autocomplete="off">
     <button id="send-btn">send</button>
@@ -250,6 +260,16 @@
     });
   }
 
+  // diagnostics: show locally and ship to the backend so we stop guessing
+  function diag(msg) {
+    try { $('env-line').textContent = msg; } catch (e) {}
+    try { api('/api/log', { msg: msg }).catch(function () {}); } catch (e) {}
+  }
+  window.addEventListener('error', function (e) { diag('page error: ' + (e.message || 'unknown')); });
+  window.addEventListener('unhandledrejection', function (e) {
+    diag('promise error: ' + ((e.reason && e.reason.message) || 'unknown'));
+  });
+
   /* ---------- auth ---------- */
   $('login-btn').addEventListener('click', doLogin);
   $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
@@ -301,7 +321,6 @@
   function scheduleResume(delay) {
     if (!wantListening) return;
     setTimeout(function () {
-      awaitingReply = false;
       tryStart();
     }, delay || RESTART_DELAY);
   }
@@ -315,12 +334,14 @@
     rec.onstart = function () {
       listening = true;
       restartCount = 0;
+      diag('mic start');
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
       $('status-line').textContent = 'listening… tap to stop';
     };
     rec.onend = function () {
       listening = false;
+      diag('mic end — restart ' + (wantListening ? 'queued' : 'off'));
       if (wantListening) {
         scheduleResume();
       } else {
@@ -330,6 +351,7 @@
       }
     };
     rec.onerror = function (e) {
+      diag('mic error: ' + e.error);
       if (e.error === 'not-allowed') {
         wantListening = false;
         listening = false;
@@ -360,6 +382,7 @@
         $('status-line').textContent = interim;
       }
       if (finalText.trim()) {
+        diag('heard: ' + finalText.trim().slice(0, 60));
         // close the mic while thinking and talking — ios crashes if sr and tts overlap
         if (listening) { try { rec.stop(); } catch (e2) { /* fine */ } }
         send(finalText.trim());
@@ -398,15 +421,6 @@
   });
 
   /* ---------- tts ---------- */
-  var cachedVoices = [];
-  function loadVoices() {
-    try { cachedVoices = window.speechSynthesis.getVoices() || []; } catch (e) { cachedVoices = []; }
-  }
-  if ('speechSynthesis' in window) {
-    loadVoices();
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-  }
-
   // ios/autoplay policy: speechSynthesis only works after it's been triggered
   // inside a user gesture. speak a silent blip on every tap so later replies
   // (which arrive from async fetches, outside gesture context) are allowed.
@@ -419,38 +433,25 @@
     } catch (e) { /* ignore */ }
   }
 
-  function pickVoice() {
-    var voices = cachedVoices.length ? cachedVoices : (window.speechSynthesis.getVoices() || []);
-    var names = ['Samantha', 'Google US English', 'Microsoft Aria', 'Microsoft Jenny', 'Karen', 'Daniel', 'Alex'];
-    for (var i = 0; i < names.length; i++) {
-      var hit = voices.find(function (v) { return v.name.indexOf(names[i]) === 0; });
-      if (hit) return hit;
-    }
-    return voices.find(function (v) { return v.lang === 'en-US' && v.localService; }) ||
-           voices.find(function (v) { return v.lang && v.lang.indexOf('en') === 0; }) ||
-           null;
-  }
-
   function speak(text) {
-    if (!voiceOn) { scheduleResume(600); return; }
-    if (!('speechSynthesis' in window)) { scheduleResume(600); return; }
+    if (!voiceOn) { awaitingReply = false; scheduleResume(600); return; }
+    if (!('speechSynthesis' in window)) { awaitingReply = false; scheduleResume(600); return; }
     try {
       window.speechSynthesis.cancel();
       var u = new SpeechSynthesisUtterance(text);
-      var v = pickVoice();
-      if (v) u.voice = v;
-      u.rate = 1.05;
-      u.volume = 1;
+      u.rate = 1.0;
       speaking = true;
-      u.onend = function () { speaking = false; scheduleResume(350); };
-      u.onerror = function () { speaking = false; scheduleResume(350); };
+      u.onend = function () { speaking = false; awaitingReply = false; diag('tts end'); scheduleResume(350); };
+      u.onerror = function (ev) {
+        speaking = false; awaitingReply = false;
+        diag('tts error: ' + (ev.error || 'unknown'));
+        scheduleResume(350);
+      };
       window.speechSynthesis.speak(u);
-      // some ios versions pause the queue instead of speaking — nudge it awake
-      setTimeout(function () {
-        try { if (window.speechSynthesis.paused) window.speechSynthesis.resume(); } catch (e) {}
-      }, 300);
+      diag('tts speak (' + text.length + ' chars)');
     } catch (e) {
-      speaking = false;
+      speaking = false; awaitingReply = false;
+      diag('tts throw: ' + e);
       scheduleResume(350);
     }
   }
@@ -503,6 +504,17 @@
   });
 
   /* ---------- boot ---------- */
+  (function () {
+    var ua = navigator.userAgent;
+    var browser = ua.indexOf('Edg') >= 0 ? 'edge' :
+                  ua.indexOf('Chrome') >= 0 ? 'chrome' :
+                  ua.indexOf('Safari') >= 0 ? 'safari' :
+                  ua.indexOf('Firefox') >= 0 ? 'firefox' : 'other';
+    var envMsg = browser + ' · sr:' + (SR ? 'yes' : 'no') +
+                 ' · tts:' + ('speechSynthesis' in window ? 'yes' : 'no') +
+                 ' · ' + (navigator.platform || 'unknown-platform');
+    diag(envMsg);
+  })();
   api('/api/session').then(function (r) {
     if (r.ok) { showChat(); greet(); }
     else { showLogin(); }

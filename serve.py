@@ -7,6 +7,7 @@ stdlib only (python 3.12). serves:
   GET  /api/session  -> {"ok": true} if authed, else 401
   POST /api/logout   -> clears cookie
   POST /api/chat     {"text": "..."} -> {"reply": "..."} via deepseek
+  POST /api/log      {"msg": "..."}  -> appends client diagnostics
   GET  /api/health   -> {"ok": true}
 
 config files (same dir as this script, chmod 600):
@@ -215,6 +216,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif path == "/api/log":
+            body = self._read_body()
+            msg = str(body.get("msg") or "")[:400]
+            ua = self.headers.get("User-Agent", "")[:250]
+            try:
+                with open(os.path.join(BASE, "client.log"), "a") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + ua + " | " + msg + "\n")
+            except Exception:
+                pass
+            self._send(200, {"ok": True})
         elif path == "/api/chat":
             sid = self._authed_session()
             if not sid:
