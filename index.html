@@ -254,6 +254,7 @@
   $('login-btn').addEventListener('click', doLogin);
   $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
   function doLogin() {
+    unlockSpeech();
     $('login-err').textContent = '';
     api('/api/login', { password: $('pw').value })
       .then(function (r) {
@@ -274,36 +275,52 @@
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   var rec = null;
   var listening = false;
+  var wantListening = false;
   var voiceOn = true;
 
   if (SR) {
     rec = new SR();
     rec.lang = 'en-US';
     rec.interimResults = true;
-    rec.continuous = false;
+    rec.continuous = true;
 
     rec.onstart = function () {
       listening = true;
+      wantListening = true;
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
-      $('status-line').textContent = 'listening…';
+      $('status-line').textContent = 'listening… tap to stop';
     };
     rec.onend = function () {
       listening = false;
-      $('mic-btn').classList.remove('active');
-      $('status-line').classList.remove('listening');
-      $('status-line').textContent = 'tap the mic. talk.';
+      if (wantListening) {
+        // the browser closed the session on its own (ios does this constantly) — reopen it
+        try { rec.start(); } catch (e) {
+          setTimeout(function () { if (wantListening) { try { rec.start(); } catch (e2) {} } }, 250);
+        }
+      } else {
+        $('mic-btn').classList.remove('active');
+        $('status-line').classList.remove('listening');
+        $('status-line').textContent = 'tap the mic. talk.';
+      }
     };
     rec.onerror = function (e) {
-      listening = false;
-      $('mic-btn').classList.remove('active');
-      $('status-line').classList.remove('listening');
       if (e.error === 'not-allowed') {
+        wantListening = false;
+        listening = false;
+        $('mic-btn').classList.remove('active');
+        $('status-line').classList.remove('listening');
         $('status-line').textContent = 'mic blocked — allow it in the browser, or type.';
-      } else if (e.error !== 'aborted' && e.error !== 'no-speech') {
-        $('status-line').textContent = 'mic error: ' + e.error;
+      } else if (e.error === 'aborted') {
+        // our own stop or a transient abort — onend handles the restart decision
+      } else if (e.error === 'no-speech') {
+        $('status-line').textContent = 'still listening… say something';
       } else {
-        $('status-line').textContent = 'tap the mic. talk.';
+        wantListening = false;
+        listening = false;
+        $('mic-btn').classList.remove('active');
+        $('status-line').classList.remove('listening');
+        $('status-line').textContent = 'mic error: ' + e.error;
       }
     };
     rec.onresult = function (e) {
@@ -329,8 +346,13 @@
 
   $('mic-btn').addEventListener('click', function () {
     if (!rec || $('mic-btn').classList.contains('disabled')) return;
-    if (listening) { rec.stop(); return; }
-    try { rec.start(); } catch (e) { /* already started */ }
+    unlockSpeech();
+    if (listening) {
+      wantListening = false;
+      try { rec.stop(); } catch (e) { /* not started */ }
+    } else {
+      try { rec.start(); } catch (e) { /* already started */ }
+    }
   });
 
   $('voice-toggle').addEventListener('change', function () {
@@ -339,21 +361,53 @@
   });
 
   /* ---------- tts ---------- */
+  var cachedVoices = [];
+  function loadVoices() {
+    try { cachedVoices = window.speechSynthesis.getVoices() || []; } catch (e) { cachedVoices = []; }
+  }
+  if ('speechSynthesis' in window) {
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+  }
+
+  // ios/autoplay policy: speechSynthesis only works after it's been triggered
+  // inside a user gesture. speak a silent blip on every tap so later replies
+  // (which arrive from async fetches, outside gesture context) are allowed.
+  function unlockSpeech() {
+    if (!('speechSynthesis' in window)) return;
+    try {
+      var u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* ignore */ }
+  }
+
+  function pickVoice() {
+    var voices = cachedVoices.length ? cachedVoices : (window.speechSynthesis.getVoices() || []);
+    var names = ['Samantha', 'Google US English', 'Microsoft Aria', 'Microsoft Jenny', 'Karen', 'Daniel', 'Alex'];
+    for (var i = 0; i < names.length; i++) {
+      var hit = voices.find(function (v) { return v.name.indexOf(names[i]) === 0; });
+      if (hit) return hit;
+    }
+    return voices.find(function (v) { return v.lang === 'en-US' && v.localService; }) ||
+           voices.find(function (v) { return v.lang && v.lang.indexOf('en') === 0; }) ||
+           null;
+  }
+
   function speak(text) {
-    if (!voiceOn) return;
+    if (!voiceOn || !('speechSynthesis' in window)) return;
     try {
       window.speechSynthesis.cancel();
       var u = new SpeechSynthesisUtterance(text);
-      var voices = window.speechSynthesis.getVoices();
-      var pref = null;
-      ['Samantha', 'Google US English', 'Microsoft Aria', 'Microsoft Jenny', 'Karen', 'Daniel'].forEach(function (n) {
-        if (!pref) pref = voices.find(function (v) { return v.name.indexOf(n) === 0; });
-      });
-      if (!pref) pref = voices.find(function (v) { return v.lang === 'en-US' && v.localService; }) ||
-                       voices.find(function (v) { return v.lang.indexOf('en') === 0; });
-      if (pref) u.voice = pref;
+      var v = pickVoice();
+      if (v) u.voice = v;
       u.rate = 1.05;
+      u.volume = 1;
       window.speechSynthesis.speak(u);
+      // some ios versions pause the queue instead of speaking — nudge it awake
+      setTimeout(function () {
+        try { if (window.speechSynthesis.paused) window.speechSynthesis.resume(); } catch (e) {}
+      }, 300);
     } catch (e) { /* tts unavailable — transcript still shows the reply */ }
   }
 
@@ -380,6 +434,7 @@
   }
 
   $('send-btn').addEventListener('click', function () {
+    unlockSpeech();
     var v = $('text-input').value.trim();
     if (!v) return;
     $('text-input').value = '';
@@ -387,6 +442,7 @@
   });
   $('text-input').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') {
+      unlockSpeech();
       var v = $('text-input').value.trim();
       if (!v) return;
       $('text-input').value = '';
