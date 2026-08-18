@@ -201,6 +201,17 @@
     <div class="brand">talk · <span>alma</span></div>
     <div class="controls">
       <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
+     <label>voice
+       <select id="voice-pick">
+         <option value="jenny">jenny</option>
+         <option value="aria">aria</option>
+         <option value="ava">ava</option>
+         <option value="emma">emma</option>
+         <option value="michelle">michelle</option>
+         <option value="andrew">andrew</option>
+         <option value="brian">brian</option>
+       </select>
+     </label>
       <button id="logout-btn">leave</button>
     </div>
   </header>
@@ -248,7 +259,7 @@
   }
   function showChat() {
     $('login-view').classList.add('hidden');
-    $('chat-view').classList.remove('hidden');
+    $('chat-view').classList.remove('hidden'); initVoice();
     $('pw').value = '';
   }
 
@@ -301,6 +312,19 @@
   var speaking = false;
   var awaitingReply = false;
   var voiceOn = true;
+  var curVoice = 'jenny';
+
+  function initVoice() {
+    try { var saved = localStorage.getItem('talk-voice'); if (saved) curVoice = saved; } catch (e) {}
+    var sel = $('voice-pick');
+    if (sel) {
+      sel.value = curVoice;
+      sel.addEventListener('change', function () {
+        curVoice = sel.value;
+        try { localStorage.setItem('talk-voice', curVoice); } catch (e) {}
+      });
+    }
+  }
   var curAudio = null;
   var pendingFinal = '';
   var finalTimer = null;
@@ -603,7 +627,7 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ text: text })
+      body: JSON.stringify({ text: text, voice: curVoice })
     })
       .then(function (r) {
         if (!r.ok) throw new Error('tts ' + r.status);

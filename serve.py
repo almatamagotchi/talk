@@ -111,15 +111,32 @@ def new_session_id():
 WHISPER_MODEL = os.path.join(BASE, "ggml-base.en.bin")
 TTS_VOICE = "en-US-JennyNeural"
 
+# allowlist — the shelf kevin is weighing. short names from the page,
+# edge-tts names here. never pass arbitrary input to edge-tts.
+VOICES = {
+    "jenny": "en-US-JennyNeural",
+    "aria": "en-US-AriaNeural",
+    "ava": "en-US-AvaNeural",
+    "emma": "en-US-EmmaNeural",
+    "michelle": "en-US-MichelleNeural",
+    "andrew": "en-US-AndrewNeural",
+    "brian": "en-US-BrianNeural",
+}
 
-def edge_tts(text):
+
+def resolve_voice(name):
+    """validate a requested voice, fall back to jenny on unknown."""
+    return VOICES.get((name or "").strip().lower(), VOICES["jenny"])
+
+
+def edge_tts(text, voice=TTS_VOICE):
     """text -> mp3 bytes (azure neural voice via edge-tts), None on failure."""
     tmp = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp3", dir=BASE, delete=False) as tf:
             tmp = tf.name
         out = subprocess.run(
-            ["/usr/local/bin/edge-tts", "--voice", TTS_VOICE,
+            ["/usr/local/bin/edge-tts", "--voice", voice,
              "--text", text, "--write-media", tmp],
             capture_output=True, timeout=45,
         )
@@ -321,11 +338,12 @@ class Handler(BaseHTTPRequestHandler):
             if not text:
                 self._send(400, {"ok": False})
                 return
-            mp3 = edge_tts(text)
+            voice = resolve_voice(body.get("voice"))
+            mp3 = edge_tts(text, voice=voice)
             if mp3 is None:
                 self._send(502, {"ok": False})
                 return
-            log("tts", len(text), "chars ->", len(mp3), "bytes")
+            log("tts", len(text), "chars,", voice, "->", len(mp3), "bytes")
             self._send_audio(200, mp3, "audio/mpeg")
         elif path == "/api/transcribe":
             sid = self._authed_session()
