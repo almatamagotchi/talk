@@ -223,6 +223,7 @@
      <label>voice
        <select id="voice-pick">
          <option value="amarante">amarante (rime)</option>
+         <option value="alma">alma (rime)</option>
           <option value="jenny">jenny</option>
          <option value="aria">aria</option>
          <option value="ava">ava</option>
@@ -653,7 +654,7 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ text: text, voice: curVoice, provider: (curVoice === 'amarante' ? 'rime' : 'edge') })
+      body: JSON.stringify({ text: text, voice: curVoice, provider: (curVoice === 'amarante' || curVoice === 'alma' ? 'rime' : 'edge') })
     })
       .then(function (r) {
         if (!r.ok) throw new Error('tts ' + r.status);

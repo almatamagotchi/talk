@@ -225,6 +225,7 @@ def edge_tts(text, voice=TTS_VOICE):
 # rime speaker ids here. never pass arbitrary input to rime.
 RIME_VOICES = {
     "amarante": "amarante",
+    "alma": "alma",
 }
 
 
