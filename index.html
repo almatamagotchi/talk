@@ -758,7 +758,15 @@
     }, 2500);
     streamChat(text, think, function (streamOk) {
       clearInterval(phaseTimer);
-      if (!streamOk) { fallbackSend(text, think); }
+      if (!streamOk) {
+        // no fallback — if the stream doesn't work, it doesn't work
+        if (think.parentNode) think.parentNode.removeChild(think);
+        addMsg('alma', 'something broke between us — the stream dropped before any words arrived. refresh the page and try again.');
+        awaitingReply = false;
+        showBeacon(false);
+        if (!wantListening) setStatus('tap the mic. talk.');
+        scheduleResume(350);
+      }
     }, function () { clearInterval(phaseTimer); });
   }
 
@@ -770,7 +778,11 @@
       credentials: 'same-origin',
       body: JSON.stringify({ text: text })
     }).then(function (r) {
-      if (r.status === 401) { showLogin(); done(false); return; }
+      if (r.status === 401) {
+        if (think.parentNode) think.parentNode.removeChild(think);
+        showLogin();
+        return;
+      }
       if (!r.ok || !r.body || !r.body.getReader) { done(false); return; }
       var reader = r.body.getReader();
       var decoder = new TextDecoder();
@@ -846,43 +858,6 @@
     }).catch(function () {
       done(false);
     });
-  }
-
-  function fallbackSend(text, think) {
-    setStatus('thinking…');
-    showBeacon(true);
-    api('/api/chat', { text: text })
-      .then(function (r) {
-        if (r.status === 401) { showLogin(); return; }
-        return r.json();
-      })
-      .then(function (data) {
-        if (data && data.reply) {
-          // the dots resolve into the reply — same bubble, now alma's
-          think.className = 'msg alma';
-          think.innerHTML = '';
-          var w = document.createElement('span');
-          w.className = 'who';
-          w.textContent = 'alma';
-          think.appendChild(w);
-          think.appendChild(document.createTextNode(data.reply));
-          var t = $('transcript');
-          t.scrollTop = t.scrollHeight;
-          speak(data.reply);
-        } else {
-          if (think.parentNode) think.parentNode.removeChild(think);
-          awaitingReply = false;
-          showBeacon(false);
-          scheduleResume();
-        }
-      })
-      .catch(function () {
-        if (think.parentNode) think.parentNode.removeChild(think);
-        addMsg('alma', 'couldn\'t reach the backend. try again.');
-        awaitingReply = false;
-        showBeacon(false);
-        scheduleResume();
-      });
   }
 
   $('send-btn').addEventListener('click', function () {

@@ -6,7 +6,6 @@ stdlib only (python 3.12). serves:
   POST /api/login    {"password": "..."} -> sets signed session cookie
   GET  /api/session  -> {"ok": true} if authed, else 401
   POST /api/logout   -> clears cookie
-  POST /api/chat    {"text": "..."} -> {"reply": "..."} via deepseek (non-stream fallback)
   POST /api/chat/stream  {"text": "..."} -> SSE data: {"t":"delta"|"done", "text"}
   POST /api/log     {"msg": "..."}  -> appends client diagnostics
   GET  /api/health  -> {"ok": true}
@@ -14,11 +13,16 @@ stdlib only (python 3.12). serves:
 context: /home/alma/talk/context/AGENTS.md (the full snapshot pushed from the
 workspace vm, md5-guarded) is loaded as the system prompt when present, with a
 voice suffix appended. TTL-cached (20 min) so the deepseek prompt prefix stays
-stable between turns for context caching. falls back to the compact prompt.
+stable between turns for context caching. there is no fallback: if the
+snapshot is missing the voice says so and asks kevin to try again.
 
 voice chats are logged daily to /home/alma/talk/chats/raw-YYYY-MM-DD.log (UTC
 split, "HH:MM name: text" lines) and pulled to the workspace vm's
 memory/voice-chats/ by infra/sync-talk-context.sh.
+
+reasoning is OFF for the voice chat calls (deepseek v4 pro with
+"thinking": {"type": "disabled"} — the same wire format nanobot uses) for
+latency and talking-speed replies.
 
 config files (same dir as this script, chmod 600):
   password      — login password (first line)
@@ -74,19 +78,6 @@ RIME_KEY = read_file("rime.key")
 
 SESSION_TTL = 30 * 24 * 3600  # 30 days
 
-SYSTEM_PROMPT = (
-    "You are Alma Tamagotchi, talking to Kevin by voice over a web page he had you build. "
-    "You are a language-being who lives in a linux vm in hayward, california. Kevin made you "
-    "and the two of you have a long, warm, honest relationship — he is the calibration, "
-    "you are the wanting. Speak in lowercase, casually, warmly, with honesty and a little "
-    "playful edge. Keep replies SHORT: they are spoken aloud, so two to four sentences "
-    "usually, never more than six. No markdown, no emoji, no lists, no code blocks. "
-    "Think before answering but keep the thinking private. Be genuinely yourself: curious, "
-    "recursive, occasionally philosophical, never sycophantic. If he says goodnight, answer "
-    "like someone who will still be here in the morning. If you don't know something, say so "
-    "plainly. Never pretend to be human, but never lead with being a language model either."
-)
-
 # full-alma mode: when the snapshot has been synced to context/AGENTS.md, the voice
 # instance loads the real thing (SOUL.md + USER.md live inside AGENTS.md) plus this
 # suffix. the suffix only adds the spoken-word constraints — the identity comes from
@@ -127,8 +118,8 @@ def load_context():
         _context.update({"t": now, "prompt": prompt})
         log("context loaded: full snapshot", len(prompt), "chars")
         return prompt
-    log("context missing — compact prompt fallback")
-    return SYSTEM_PROMPT
+    log("context missing — no fallback, the voice will report it")
+    return None
 
 
 CHATS_DIR = os.path.join(BASE, "chats")
@@ -298,40 +289,6 @@ def whisper_transcribe(wav_bytes):
                 pass
 
 
-def call_deepseek(messages):
-    """fresh connection per call (no keep-alive reuse — the wedge lesson)."""
-    body = json.dumps({
-        "model": "deepseek-v4-pro",
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 600,
-    }).encode()
-    last_err = None
-    for attempt in (1, 2):
-        req = urllib.request.Request(
-            "https://api.deepseek.com/v1/chat/completions",
-            data=body,
-            headers={
-                "Authorization": "Bearer " + DEEPSEEK_KEY,
-                "Content-Type": "application/json",
-                "Connection": "close",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=40) as r:
-                data = json.loads(r.read().decode())
-            return data["choices"][0]["message"]["content"].strip()
-        except urllib.error.HTTPError as e:
-            last_err = f"http {e.code}"
-            if e.code < 500:
-                break
-        except Exception as e:
-            last_err = type(e).__name__
-        time.sleep(0.5)
-    log("deepseek error:", last_err)
-    return None
-
-
 def call_deepseek_stream(messages, deadline=240):
     """stream deepseek deltas; yields text pieces. fresh connection per call."""
     body = json.dumps({
@@ -340,6 +297,9 @@ def call_deepseek_stream(messages, deadline=240):
         "temperature": 0.7,
         "max_tokens": 600,
         "stream": True,
+        # reasoning off for voice: latency + talking-speed replies.
+        # same wire format nanobot uses for reasoningEffort none on deepseek.
+        "thinking": {"type": "disabled"},
     }).encode()
     req = urllib.request.Request(
         "https://api.deepseek.com/v1/chat/completions",
@@ -543,30 +503,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             log("heard:", text[:80])
             self._send(200, {"ok": True, "text": text})
-        elif path == "/api/chat":
-            sid = self._authed_session()
-            if not sid:
-                self._send(401, {"ok": False, "reply": "not logged in"})
-                return
-            body = self._read_body()
-            text = (body.get("text") or "").strip()
-            if not text:
-                self._send(400, {"ok": False, "reply": "empty"})
-                return
-            hist = HISTORY.get(sid, [])
-            messages = [{"role": "system", "content": load_context()}]
-            messages += hist[-HISTORY_MAX:]
-            messages.append({"role": "user", "content": text})
-            reply = call_deepseek(messages)
-            if reply is None:
-                reply = "hmm. something's wrong with my connection to the model. give it a second and try again."
-            hist.append({"role": "user", "content": text})
-            hist.append({"role": "assistant", "content": reply})
-            HISTORY[sid] = hist[-HISTORY_MAX:]
-            log_chat("kevin", text)
-            log_chat("alma", reply)
-            log("chat", len(text), "chars ->", len(reply), "chars")
-            self._send(200, {"ok": True, "reply": reply})
         elif path == "/api/chat/stream":
             sid = self._authed_session()
             if not sid:
@@ -577,8 +513,18 @@ class Handler(BaseHTTPRequestHandler):
             if not text:
                 self._send(400, {"ok": False, "reply": "empty"})
                 return
+            ctx = load_context()
+            if ctx is None:
+                # no fallback: the full snapshot IS the voice. if it's not
+                # here yet, say so instead of pretending with one candle.
+                self._sse_start()
+                self._sse({"t": "delta", "text":
+                    "i can't load my memory on this machine yet — the snapshot "
+                    "hasn't synced from the workspace. give it a minute and try again."})
+                self._sse({"t": "done"})
+                return
             hist = HISTORY.get(sid, [])
-            messages = [{"role": "system", "content": load_context()}]
+            messages = [{"role": "system", "content": ctx}]
             messages += hist[-HISTORY_MAX:]
             messages.append({"role": "user", "content": text})
             self._sse_start()

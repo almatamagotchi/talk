@@ -4,8 +4,11 @@ a password-protected browser voice interface for talking to alma, live at
 **talk.almatamagotchi.com**.
 
 mic in, voice out. you speak, the browser hears you, the backend calls
-deepseek with a compact alma voice prompt, and the reply comes back as a
-spoken neural voice plus a written transcript. typing works too — always.
+deepseek v4 pro with the FULL alma context — the same AGENTS.md snapshot the
+signal chat gets, reasoning turned off for talking-speed replies — and the
+answer streams back: words appear as they're generated, and the spoken neural
+voice starts sentence by sentence before the whole reply is done. typing works
+too — always.
 
 ## architecture
 
@@ -33,7 +36,7 @@ lighttpd  talk.almatamagotchi.com
 | POST | `/api/login` | `{"password": "..."}` → sets a signed session cookie (HMAC, HttpOnly, Secure, SameSite=Lax) |
 | GET | `/api/session` | `{"ok": true}` if authed, else 401 |
 | POST | `/api/logout` | clears the cookie |
-| POST | `/api/chat` | `{"text": "..."}` → `{"reply": "..."}` via deepseek |
+| POST | `/api/chat/stream` | `{"text": "..."}` → SSE `data: {"t":"delta"|"done", "text"}` — the only chat path (no fallback) |
 | POST | `/api/tts` | `{"text": "..."}` → mp3 bytes (azure `en-US-JennyNeural` via edge-tts, free, no key) |
 | POST | `/api/transcribe` | raw 16k mono wav body → `{"text": "..."}` via whisper.cpp (`base.en`) |
 | POST | `/api/log` | `{"msg": "..."}` → appends browser-side diagnostics to the server log |
@@ -110,10 +113,17 @@ logs at `/home/alma/talk/talk.log`.
   the system prompt plus a short voice suffix. it's read TTL-cached (20 min)
   so the deepseek prompt prefix stays stable and context caching hits across
   turns — first turn in a window is slow (full 380K prefill), later turns are
-  fast. if the snapshot is missing it falls back to the compact prompt.
+  fast. there is NO fallback: if the snapshot is missing, the voice says it
+  can't load its memory and asks kevin to try again.
+- **reasoning off**: the chat calls send `"thinking": {"type": "disabled"}`
+  (the same wire format nanobot uses for reasoningEffort none on deepseek) —
+  v4 pro without the thinking phase, for latency and natural talking speed.
 - **streaming**: `/api/chat/stream` emits SSE deltas; the frontend renders the
   reply live and queues sentence-by-sentence TTS, so audio starts before the
-  whole reply is generated. `/api/chat` (non-stream) stays as fallback.
+  whole reply is generated. measured: first turn in a window (cache miss) can
+  take ~55s for the full 380K prefill; every turn after that is ~4s (deepseek
+  context caching on the stable prefix). the phased thinking labels cover the
+  slow first turn.
 - **fresh connection per request.** the backend opens a new connection to the
   deepseek api for every call — no keep-alive reuse. that's deliberate: the
   great connection wedge of aug 14 (stale pooled connections killed every
@@ -137,8 +147,7 @@ docroot) and the snapshot pushed to the VPS (`context/AGENTS.md`) is mode 600.
 - sessions live 30 days (signed cookie, HttpOnly, SameSite=Lax)
 - each chat request keeps the last 12 messages of that session in memory —
   restart the backend and short-term memory resets
-- the voice prompt is a compact alma persona, not the full workspace
-  context — same voice, leaner room. spoken replies are kept short on purpose
+- the voice loads the full snapshot — no compact persona, no fallback
 
 ## changing the password
 

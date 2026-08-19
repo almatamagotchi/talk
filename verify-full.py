@@ -47,14 +47,14 @@ time.sleep(2.5)
 with urllib.request.urlopen("http://127.0.0.1:8092/api/health", timeout=5) as r:
     print("health:", r.status)
 
-# ---- 4. auth + non-stream chat (proves full context + logging) ----
+# ---- 4. auth + stream chat (SSE, reasoning off) ----
 with open(os.path.join(BASE, "password")) as f:
     password = f.read().strip()
 cj = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
 
-def post_json(path, payload, stream=False):
+def post_json(path, payload):
     req = urllib.request.Request(
         BASE_URL + path, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **UA}, method="POST")
@@ -65,20 +65,14 @@ t0 = time.time()
 r = post_json("/api/login", {"password": password})
 print("login:", r.status)
 
-r = post_json("/api/chat", {"text": "test: this is the full context check."})
-reply = json.loads(r.read()).get("reply", "")
-print(f"chat (non-stream): {r.status} · {len(reply)} chars · {time.time()-t0:.1f}s total")
-print("  reply:", reply[:160])
-
-# ---- 5. stream chat (SSE) ----
-t0 = time.time()
 req = urllib.request.Request(
-    BASE_URL + "/api/chat/stream", data=json.dumps({"text": "stream test. one short reply please."}).encode(),
+    BASE_URL + "/api/chat/stream", data=json.dumps({"text": "test: this is the full context check."}).encode(),
     headers={"Content-Type": "application/json", **UA}, method="POST")
 first_at = None
 n_delta = 0
 total_chars = 0
 done_seen = False
+reply = []
 with opener.open(req, timeout=300) as r:
     print("stream: status", r.status)
     buf = b""
@@ -100,9 +94,12 @@ with opener.open(req, timeout=300) as r:
                         print(f"  first delta at {time.time()-t0:.1f}s")
                     n_delta += 1
                     total_chars += len(obj.get("text") or "")
+                    reply.append(obj.get("text") or "")
                 elif obj.get("t") == "done":
                     done_seen = True
-print(f"stream: {n_delta} deltas · {total_chars} chars · done={done_seen} · {time.time()-t0:.1f}s")
+full_reply = "".join(reply).strip()
+print(f"stream: {n_delta} deltas · {total_chars} chars · done={done_seen} · {time.time()-t0:.1f}s total")
+print("  reply:", full_reply[:200])
 
 # ---- 6. chat log on disk ----
 logs = sorted(os.listdir(os.path.join(BASE, "chats"))) if os.path.isdir(os.path.join(BASE, "chats")) else []
