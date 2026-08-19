@@ -109,10 +109,22 @@ for name in logs[-1:]:
     for line in open(os.path.join(BASE, "chats", name)).read().strip().splitlines()[-6:]:
         print(" ", line)
 
-# ---- 7. rime tts still good ----
+# ---- 7. rime tts still good + long-text no longer truncates ----
 r = post_json("/api/tts", {"text": "the whole house is behind the voice now.", "voice": "amarante", "provider": "rime"})
 data = r.read()
 print(f"tts rime/amarante: {r.status} · {len(data)}B · magic={data[:3].hex()}")
+
+long_text = "the water tower has been counting since 1895 and the room has the lights on. " * 18
+r = post_json("/api/tts", {"text": long_text, "voice": "amarante", "provider": "rime"})
+long_data = r.read()
+long_path = "/tmp/tts-long-check.mp3"
+open(long_path, "wb").write(long_data)
+probe = subprocess.run(
+    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", long_path],
+    capture_output=True, text=True)
+dur = float(probe.stdout.strip() or 0)
+print(f"tts long ({len(long_text)} chars): {r.status} · {len(long_data)}B · duration {dur:.1f}s "
+      f"(truncated if < 60s — was the [:400] cap bug)")
 
 # ---- 8. context line in talk.log ----
 for line in open(os.path.join(BASE, "talk.log")).read().strip().splitlines():

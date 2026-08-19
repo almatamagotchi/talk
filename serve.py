@@ -39,6 +39,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -258,6 +259,48 @@ def rime_tts(text, speaker="amarante"):
         return None
 
 
+MAX_TTS_CHUNK = 350  # chars per provider call — safely under rime's ~500 input cap
+
+
+def tts_chunks(text):
+    """split into sentence-boundary chunks, each under MAX_TTS_CHUNK chars."""
+    parts = re.split(r"(?<=[.!?…])\s+", text.strip())
+    chunks, cur = [], ""
+    for p in parts:
+        if cur and len(cur) + len(p) + 1 > MAX_TTS_CHUNK:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = (cur + " " + p).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks or [text.strip()]
+
+
+def concat_mp3s(files):
+    """join mp3 files into one continuous mp3 via ffmpeg. returns a path or None.
+
+    re-encodes with the concat filter (rather than the -c copy demuxer) so id3
+    tags from the later chunks get stripped and the result is one clean clip."""
+    try:
+        out = os.path.join(tempfile.gettempdir(), "tts-join-%d.mp3" % os.getpid())
+        n = len(files)
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        for f in files:
+            cmd += ["-i", f]
+        cmd += ["-filter_complex",
+                "[0:a]" + "".join("[%d:a]" % i for i in range(1, n)) +
+                "concat=n=%d:v=0:a=1[a]" % n,
+                "-map", "[a]", "-c:a", "libmp3lame", "-b:a", "64k", out]
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+        log("ffmpeg concat failed:", r.returncode, r.stderr[:140])
+    except Exception as e:
+        log("concat error:", type(e).__name__)
+    return None
+
+
 def whisper_transcribe(wav_bytes):
     """16k mono wav bytes -> text via whisper.cpp, None on failure."""
     tmp = None
@@ -466,7 +509,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"ok": False})
                 return
             body = self._read_body()
-            text = (body.get("text") or "").strip()[:400]
+            text = (body.get("text") or "").strip()
             if not text:
                 self._send(400, {"ok": False})
                 return
@@ -478,15 +521,45 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(502, {"ok": False})
                     return
                 speaker = RIME_VOICES.get(voice, "amarante")
-                mp3 = rime_tts(text, speaker=speaker)
+                gen = lambda t: rime_tts(t, speaker=speaker)
                 voice_label = "rime/" + speaker
             else:
-                mp3 = edge_tts(text, voice=voice)
+                gen = lambda t: edge_tts(t, voice=voice)
                 voice_label = voice
-            if mp3 is None:
-                self._send(502, {"ok": False})
-                return
-            log("tts", len(text), "chars,", voice_label, "->", len(mp3), "bytes")
+            # long replies hit the providers' input caps (~500 chars) and got
+            # silently cut off mid-speech — so chunk at sentence boundaries and
+            # re-join into ONE continuous mp3, keeping the single-clip sound.
+            chunks = tts_chunks(text)
+            piece_files = []
+            try:
+                for c in chunks:
+                    piece = gen(c)
+                    if piece is None:
+                        self._send(502, {"ok": False})
+                        return
+                    pf = os.path.join(tempfile.gettempdir(), "tts-p%d-%d.mp3" % (os.getpid(), len(piece_files)))
+                    with open(pf, "wb") as f:
+                        f.write(piece)
+                    piece_files.append(pf)
+                if len(piece_files) == 1:
+                    with open(piece_files[0], "rb") as f:
+                        mp3 = f.read()
+                else:
+                    joined = concat_mp3s(piece_files)
+                    if joined is None:
+                        log("concat failed — serving first chunk only")
+                        with open(piece_files[0], "rb") as f:
+                            mp3 = f.read()
+                    else:
+                        with open(joined, "rb") as f:
+                            mp3 = f.read()
+            finally:
+                for pf in piece_files:
+                    try:
+                        os.remove(pf)
+                    except OSError:
+                        pass
+            log("tts", len(text), "chars, ", len(chunks), "chunk(s), ", voice_label, "->", len(mp3), "bytes")
             self._send_audio(200, mp3, "audio/mpeg")
         elif path == "/api/transcribe":
             sid = self._authed_session()
