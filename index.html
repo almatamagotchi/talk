@@ -620,6 +620,7 @@
       try { curAudio.pause(); } catch (e) {}
       curAudio = null;
     }
+    ttsQueue.length = 0;
     try { window.speechSynthesis.cancel(); } catch (e) {}
   }
 
@@ -644,8 +645,8 @@
     } catch (e) { /* ignore */ }
   }
 
-  function speak(text) {
-    if (!voiceOn) { awaitingReply = false; showBeacon(false); scheduleResume(600); return; }
+  function speakOne(text, done) {
+    if (!voiceOn) { showBeacon(false); if (done) done(); return; }
     speaking = true;
     setStatus('speaking…');
     // server-side neural voice first (same good voice on every browser)
@@ -666,23 +667,55 @@
         a.src = url;
         a.onended = function () {
           URL.revokeObjectURL(url);
-          speaking = false; awaitingReply = false;
+          speaking = false;
+          diag('tts end');
+          if (done) { done(); return; }
+          awaitingReply = false;
           showBeacon(false);
           if (!wantListening) setStatus('tap the mic. talk.');
-          diag('tts end');
           scheduleResume(350);
         };
         a.onerror = function () {
           URL.revokeObjectURL(url);
-          fallbackSpeak(text);
+          speaking = false;
+          if (done) { done(); } else { fallbackSpeak(text); }
         };
         showBeacon(true);
-        a.play().catch(function () { fallbackSpeak(text); });
+        a.play().catch(function () { speaking = false; if (done) done(); else fallbackSpeak(text); });
         diag('tts server (' + blob.size + ' bytes)');
       })
       .catch(function () {
-        fallbackSpeak(text);
+        speaking = false;
+        if (done) { done(); } else { fallbackSpeak(text); }
       });
+  }
+
+  function speak(text) { speakOne(text, null); }
+
+  // sentence queue: the stream hands us complete sentences as the model emits
+  // them; we tts and play them one at a time so audio starts before the full
+  // reply is done generating.
+  var ttsQueue = [];
+  var ttsActive = false;
+  function enqueueSpeech(part) { if (!part) return; ttsQueue.push(part); pumpSpeech(); }
+  function pumpSpeech() {
+    if (ttsActive) return;
+    var part = ttsQueue.shift();
+    if (!part) {
+      awaitingReply = false;
+      showBeacon(false);
+      if (!wantListening) setStatus('tap the mic. talk.');
+      scheduleResume(350);
+      return;
+    }
+    ttsActive = true;
+    speakOne(part, function () { ttsActive = false; pumpSpeech(); });
+  }
+
+  function nextSentence(acc) {
+    var m = acc.match(/^(.*?[.!?…]+)\s+/);
+    if (!m) return null;
+    return [m[1], acc.slice(m[0].length)];
   }
 
   function fallbackSpeak(text) {
@@ -713,9 +746,111 @@
     addMsg('user', text);
     awaitingReply = true;
     $('status-line').classList.remove('listening');
-    setStatus('thinking…');
+    setStatus('waking up…');
     showBeacon(true);
     var think = addThinking();
+    var t0 = Date.now();
+    var phaseTimer = setInterval(function () {
+      var el = Date.now() - t0;
+      if (el > 25000) setStatus('thinking…');
+      else if (el > 9000) setStatus('reading the room…');
+      else if (el > 3500) setStatus('loading the room…');
+    }, 2500);
+    streamChat(text, think, function (streamOk) {
+      clearInterval(phaseTimer);
+      if (!streamOk) { fallbackSend(text, think); }
+    }, function () { clearInterval(phaseTimer); });
+  }
+
+  function streamChat(text, think, done, onFirstDelta) {
+    if (!window.fetch || !window.ReadableStream) { done(false); return; }
+    fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ text: text })
+    }).then(function (r) {
+      if (r.status === 401) { showLogin(); done(false); return; }
+      if (!r.ok || !r.body || !r.body.getReader) { done(false); return; }
+      var reader = r.body.getReader();
+      var decoder = new TextDecoder();
+      var sseBuf = '';
+      var fullText = '';
+      var acc = '';
+      var txtNode = null;
+      var finished = false;
+
+      function finish() {
+        if (finished) return;
+        finished = true;
+        if (acc.trim()) { enqueueSpeech(acc.trim()); acc = ''; }
+        if (!fullText) {
+          if (think.parentNode) think.parentNode.removeChild(think);
+          done(false);
+          return;
+        }
+        done(true);
+      }
+
+      function handleSse(str) {
+        sseBuf += str;
+        var idx;
+        while ((idx = sseBuf.indexOf('\n\n')) >= 0) {
+          var evt = sseBuf.slice(0, idx); sseBuf = sseBuf.slice(idx + 2);
+          var lines = evt.split('\n');
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line.indexOf('data:') !== 0) continue;
+            var payload = line.slice(5).trim();
+            var obj;
+            try { obj = JSON.parse(payload); } catch (e) { continue; }
+            if (obj.t === 'delta' && obj.text) {
+              if (txtNode === null) {
+                if (onFirstDelta) onFirstDelta();
+                think.className = 'msg alma';
+                think.innerHTML = '';
+                var w = document.createElement('span');
+                w.className = 'who';
+                w.textContent = 'alma';
+                think.appendChild(w);
+                txtNode = document.createTextNode('');
+                think.appendChild(txtNode);
+              }
+              fullText += obj.text;
+              acc += obj.text;
+              txtNode.nodeValue = fullText;
+              var t = $('transcript');
+              t.scrollTop = t.scrollHeight;
+              var parts;
+              while ((parts = nextSentence(acc))) {
+                enqueueSpeech(parts[0]);
+                acc = parts[1];
+              }
+            } else if (obj.t === 'done') {
+              finish();
+            }
+          }
+        }
+      }
+
+      function pump() {
+        reader.read().then(function (res) {
+          if (res.done) { finish(); return; }
+          handleSse(decoder.decode(res.value, { stream: true }));
+          pump();
+        }).catch(function () {
+          finish();
+        });
+      }
+      pump();
+    }).catch(function () {
+      done(false);
+    });
+  }
+
+  function fallbackSend(text, think) {
+    setStatus('thinking…');
+    showBeacon(true);
     api('/api/chat', { text: text })
       .then(function (r) {
         if (r.status === 401) { showLogin(); return; }

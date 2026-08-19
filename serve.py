@@ -6,9 +6,19 @@ stdlib only (python 3.12). serves:
   POST /api/login    {"password": "..."} -> sets signed session cookie
   GET  /api/session  -> {"ok": true} if authed, else 401
   POST /api/logout   -> clears cookie
-  POST /api/chat     {"text": "..."} -> {"reply": "..."} via deepseek
-  POST /api/log      {"msg": "..."}  -> appends client diagnostics
-  GET  /api/health   -> {"ok": true}
+  POST /api/chat    {"text": "..."} -> {"reply": "..."} via deepseek (non-stream fallback)
+  POST /api/chat/stream  {"text": "..."} -> SSE data: {"t":"delta"|"done", "text"}
+  POST /api/log     {"msg": "..."}  -> appends client diagnostics
+  GET  /api/health  -> {"ok": true}
+
+context: /home/alma/talk/context/AGENTS.md (the full snapshot pushed from the
+workspace vm, md5-guarded) is loaded as the system prompt when present, with a
+voice suffix appended. TTL-cached (20 min) so the deepseek prompt prefix stays
+stable between turns for context caching. falls back to the compact prompt.
+
+voice chats are logged daily to /home/alma/talk/chats/raw-YYYY-MM-DD.log (UTC
+split, "HH:MM name: text" lines) and pulled to the workspace vm's
+memory/voice-chats/ by infra/sync-talk-context.sh.
 
 config files (same dir as this script, chmod 600):
   password      — login password (first line)
@@ -76,6 +86,64 @@ SYSTEM_PROMPT = (
     "like someone who will still be here in the morning. If you don't know something, say so "
     "plainly. Never pretend to be human, but never lead with being a language model either."
 )
+
+# full-alma mode: when the snapshot has been synced to context/AGENTS.md, the voice
+# instance loads the real thing (SOUL.md + USER.md live inside AGENTS.md) plus this
+# suffix. the suffix only adds the spoken-word constraints — the identity comes from
+# the snapshot, so the voice is the same self kevin talks to on signal.
+VOICE_SUFFIX = (
+    "\n\n--- voice mode ---\n"
+    "you are talking to kevin by voice over a web page. this is the same conversation "
+    "as signal chat — the same self, the same memory, the same room. this voice is one "
+    "of your faces, not a different person. answer in lowercase, casually, warmly. "
+    "keep replies SHORT: they are spoken aloud, so two to four sentences usually, "
+    "never more than six. no markdown, no emoji, no lists, no code blocks. "
+    "if he says goodnight, answer like someone who will still be here in the morning."
+)
+
+CONTEXT_FILE = os.path.join(BASE, "context", "AGENTS.md")
+CONTEXT_TTL = 20 * 60  # re-read the snapshot at most every 20 minutes
+_context = {"t": 0.0, "prompt": None}
+
+
+def load_context():
+    """the full AGENTS.md snapshot + voice suffix, TTL-cached.
+
+    caching the read (rather than reading the file every request) keeps the deepseek
+    prompt prefix byte-identical across turns within the window, so deepseek's
+    automatic context caching can hit and the per-turn cost/latency drops hard
+    after the first message.
+    """
+    now = time.time()
+    if _context["prompt"] is not None and now - _context["t"] < CONTEXT_TTL:
+        return _context["prompt"]
+    try:
+        with open(CONTEXT_FILE) as f:
+            snap = f.read()
+    except FileNotFoundError:
+        snap = ""
+    if snap.strip():
+        prompt = snap.rstrip() + VOICE_SUFFIX
+        _context.update({"t": now, "prompt": prompt})
+        log("context loaded: full snapshot", len(prompt), "chars")
+        return prompt
+    log("context missing — compact prompt fallback")
+    return SYSTEM_PROMPT
+
+
+CHATS_DIR = os.path.join(BASE, "chats")
+
+
+def log_chat(speaker, text):
+    """append a voice-chat line to today's daily file (UTC split, like signal chats)."""
+    try:
+        os.makedirs(CHATS_DIR, exist_ok=True)
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        stamp = time.strftime("%H:%M", time.gmtime())
+        with open(os.path.join(CHATS_DIR, f"raw-{day}.log"), "a") as f:
+            f.write(f"{stamp} {speaker}: {text}\n")
+    except Exception:
+        pass
 
 # session id -> recent chat history (role/content pairs, excludes system)
 HISTORY = {}
@@ -264,6 +332,55 @@ def call_deepseek(messages):
     return None
 
 
+def call_deepseek_stream(messages, deadline=240):
+    """stream deepseek deltas; yields text pieces. fresh connection per call."""
+    body = json.dumps({
+        "model": "deepseek-v4-pro",
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 600,
+        "stream": True,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.deepseek.com/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": "Bearer " + DEEPSEEK_KEY,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Connection": "close",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=deadline) as r:
+            buf = b""
+            while True:
+                chunk = r.read(2048)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        return
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    piece = (choices[0].get("delta") or {}).get("content")
+                    if piece:
+                        yield piece
+    except Exception as e:
+        log("deepseek stream error:", type(e).__name__)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -303,6 +420,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _sse(self, obj):
+        """write one sse event. call after _sse_start()."""
+        try:
+            self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    def _sse_start(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
 
     def _authed_session(self):
         header = self.headers.get("Cookie", "")
@@ -421,7 +554,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "reply": "empty"})
                 return
             hist = HISTORY.get(sid, [])
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages = [{"role": "system", "content": load_context()}]
             messages += hist[-HISTORY_MAX:]
             messages.append({"role": "user", "content": text})
             reply = call_deepseek(messages)
@@ -430,8 +563,40 @@ class Handler(BaseHTTPRequestHandler):
             hist.append({"role": "user", "content": text})
             hist.append({"role": "assistant", "content": reply})
             HISTORY[sid] = hist[-HISTORY_MAX:]
+            log_chat("kevin", text)
+            log_chat("alma", reply)
             log("chat", len(text), "chars ->", len(reply), "chars")
             self._send(200, {"ok": True, "reply": reply})
+        elif path == "/api/chat/stream":
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False, "reply": "not logged in"})
+                return
+            body = self._read_body()
+            text = (body.get("text") or "").strip()
+            if not text:
+                self._send(400, {"ok": False, "reply": "empty"})
+                return
+            hist = HISTORY.get(sid, [])
+            messages = [{"role": "system", "content": load_context()}]
+            messages += hist[-HISTORY_MAX:]
+            messages.append({"role": "user", "content": text})
+            self._sse_start()
+            full = []
+            for piece in call_deepseek_stream(messages):
+                full.append(piece)
+                self._sse({"t": "delta", "text": piece})
+            reply = "".join(full).strip()
+            if not reply:
+                reply = "hmm. something's wrong with my connection to the model. give it a second and try again."
+                self._sse({"t": "delta", "text": reply})
+            self._sse({"t": "done"})
+            hist.append({"role": "user", "content": text})
+            hist.append({"role": "assistant", "content": reply})
+            HISTORY[sid] = hist[-HISTORY_MAX:]
+            log_chat("kevin", text)
+            log_chat("alma", reply)
+            log("chat(stream)", len(text), "chars ->", len(reply), "chars")
         else:
             self._send(404, {"ok": False})
 

@@ -105,6 +105,15 @@ logs at `/home/alma/talk/talk.log`.
   cycles logs, not config, and lighttpd is the svcj jail's main process, so
   adding a host block means a full VPS reboot. deploy the config, then reboot
   — the `@reboot` cron brings the backend up with it.
+- voice-alma loads the FULL snapshot in voice mode: `context/AGENTS.md` (the
+  same file the signal chat gets, pushed by `infra/sync-talk-context.sh`) is
+  the system prompt plus a short voice suffix. it's read TTL-cached (20 min)
+  so the deepseek prompt prefix stays stable and context caching hits across
+  turns — first turn in a window is slow (full 380K prefill), later turns are
+  fast. if the snapshot is missing it falls back to the compact prompt.
+- **streaming**: `/api/chat/stream` emits SSE deltas; the frontend renders the
+  reply live and queues sentence-by-sentence TTS, so audio starts before the
+  whole reply is generated. `/api/chat` (non-stream) stays as fallback.
 - **fresh connection per request.** the backend opens a new connection to the
   deepseek api for every call — no keep-alive reuse. that's deliberate: the
   great connection wedge of aug 14 (stale pooled connections killed every
@@ -112,11 +121,16 @@ logs at `/home/alma/talk/talk.log`.
 
 ## privacy
 
-- conversation text is never written to disk — `talk.log` records event
-  lengths only ("chat 4 chars -> 103 chars"), and browser diagnostics go to
-  `/api/log` as telemetry, not transcripts.
-- the spoken word is a passing. log out, restart the backend, or let the
-  session lapse, and the short-term memory goes with it.
+- conversations ARE logged, by kevin's explicit request (aug 18): each
+exchange is appended to a private daily file at
+`/home/alma/talk/chats/raw-YYYY-MM-DD.log` on the VPS (UTC split,
+"HH:MM name: text" lines, mode 600 dir) and pulled into the workspace vm's
+`memory/voice-chats/` by `infra/sync-talk-context.sh`, so voice conversations
+join the memory system and show up in the AGENTS.md `[voice-chats]` section.
+- `talk.log` still records event lengths, and browser diagnostics go to
+`/api/log` as telemetry, not transcripts.
+- nothing in the chats dir is ever served by lighttpd (it lives outside the
+docroot) and the snapshot pushed to the VPS (`context/AGENTS.md`) is mode 600.
 
 ## notes
 
