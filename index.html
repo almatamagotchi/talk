@@ -222,7 +222,8 @@
       <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
      <label>voice
        <select id="voice-pick">
-         <option value="jenny">jenny</option>
+         <option value="amarante">amarante (rime)</option>
+          <option value="jenny">jenny</option>
          <option value="aria">aria</option>
          <option value="ava">ava</option>
          <option value="emma">emma</option>
@@ -652,7 +653,7 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ text: text, voice: curVoice })
+      body: JSON.stringify({ text: text, voice: curVoice, provider: (curVoice === 'amarante' ? 'rime' : 'edge') })
     })
       .then(function (r) {
         if (!r.ok) throw new Error('tts ' + r.status);

@@ -60,6 +60,7 @@ PASSWORD = read_file("password")
 SECRET_HEX = read_file("secret.key")
 SECRET = bytes.fromhex(SECRET_HEX) if SECRET_HEX else b""
 DEEPSEEK_KEY = read_file("deepseek.key")
+RIME_KEY = read_file("rime.key")
 
 SESSION_TTL = 30 * 24 * 3600  # 30 days
 
@@ -158,6 +159,44 @@ def edge_tts(text, voice=TTS_VOICE):
                 os.unlink(tmp)
             except Exception:
                 pass
+
+
+# rime voices kevin is weighing — short names from the page,
+# rime speaker ids here. never pass arbitrary input to rime.
+RIME_VOICES = {
+    "amarante": "amarante",
+}
+
+
+def rime_tts(text, speaker="amarante"):
+    """text -> mp3 bytes via rime (coda model), None on failure."""
+    body = json.dumps({
+        "speaker": speaker,
+        "text": text,
+        "modelId": "coda",
+        "lang": "en",
+        "samplingRate": 24000,
+    }).encode()
+    req = urllib.request.Request(
+        "https://users.rime.ai/v1/rime-tts",
+        data=body,
+        headers={
+            "Authorization": "Bearer " + RIME_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+            "Connection": "close",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            data = r.read()
+        if len(data) < 300:
+            log("rime tts tiny output", len(data))
+            return None
+        return data
+    except Exception as e:
+        log("rime tts error:", type(e).__name__)
+        return None
 
 
 def whisper_transcribe(wav_bytes):
@@ -339,11 +378,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False})
                 return
             voice = resolve_voice(body.get("voice"))
-            mp3 = edge_tts(text, voice=voice)
+            provider = (body.get("provider") or "").strip().lower()
+            if provider == "rime":
+                if not RIME_KEY:
+                    log("tts rime requested but no rime.key")
+                    self._send(502, {"ok": False})
+                    return
+                speaker = RIME_VOICES.get(voice, "amarante")
+                mp3 = rime_tts(text, speaker=speaker)
+                voice_label = "rime/" + speaker
+            else:
+                mp3 = edge_tts(text, voice=voice)
+                voice_label = voice
             if mp3 is None:
                 self._send(502, {"ok": False})
                 return
-            log("tts", len(text), "chars,", voice, "->", len(mp3), "bytes")
+            log("tts", len(text), "chars,", voice_label, "->", len(mp3), "bytes")
             self._send_audio(200, mp3, "audio/mpeg")
         elif path == "/api/transcribe":
             sid = self._authed_session()
