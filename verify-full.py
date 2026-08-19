@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""restart the talk backend and verify full-alma mode end to end."""
+"""restart the talk backend and verify the two-stage gate end to end.
+
+covers: site password gate -> identity question -> kevin session (full
+snapshot) and guest session (lean prompt + guest logging), plus the guest
+log file staying separate from kevin's.
+"""
 import http.cookiejar
 import json
 import os
@@ -18,11 +23,88 @@ def run(args):
     return subprocess.run(args, capture_output=True, text=True)
 
 
-# ---- 1. stop current backend ----
+def read_secret(name):
+    with open(os.path.join(BASE, name)) as f:
+        return f.read().strip()
+
+
+def new_client():
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    return cj, opener
+
+
+def post_json(opener, path, payload, raw=False):
+    req = urllib.request.Request(
+        BASE_URL + path,
+        data=json.dumps(payload).encode() if not raw else payload,
+        headers={"Content-Type": "application/json", **UA},
+        method="POST")
+    try:
+        return opener.open(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        return e
+
+
+def get(opener, path):
+    req = urllib.request.Request(BASE_URL + path, headers=UA)
+    try:
+        return opener.open(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        return e
+
+
+def stream_chat(opener, text):
+    """POST /api/chat/stream and collect the SSE deltas into a reply string."""
+    req = urllib.request.Request(
+        BASE_URL + "/api/chat/stream",
+        data=json.dumps({"text": text}).encode(),
+        headers={"Content-Type": "application/json", **UA},
+        method="POST")
+    try:
+        r = opener.open(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        return e.status, ""
+    buf = b""
+    reply = ""
+    done = False
+    while True:
+        chunk = r.read(2048)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n\n" in buf:
+            evt, buf = buf.split(b"\n\n", 1)
+            for line in evt.split(b"\n"):
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except Exception:
+                    continue
+                if obj.get("t") == "delta" and obj.get("text"):
+                    reply += obj["text"]
+                elif obj.get("t") == "done":
+                    done = True
+    return r.status, reply
+
+
+def tail_log(n=6):
+    with open(os.path.join(BASE, "talk.log")) as f:
+        lines = [l.rstrip() for l in f.readlines()]
+    return lines[-n:]
+
+
+# ---- 1. restart backend ----
 out = run(["pgrep", "-f", r"serve\.py$"])
-targets = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
 me = os.getpid()
-for p in targets:
+for p in out.stdout.split():
+    if not p.strip().isdigit():
+        continue
+    p = int(p)
     if p == me:
         continue
     try:
@@ -35,99 +117,81 @@ try:
     os.remove(os.path.join(BASE, "talk.pid"))
 except FileNotFoundError:
     pass
-
-# ---- 2. start fresh ----
 subprocess.Popen(
     ["/usr/sbin/daemon", "-f", "-p", os.path.join(BASE, "talk.pid"),
      "/usr/local/bin/python3", os.path.join(BASE, "serve.py")],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(2.5)
 
-# ---- 3. health ----
 with urllib.request.urlopen("http://127.0.0.1:8092/api/health", timeout=5) as r:
     print("health:", r.status)
 
-# ---- 4. auth + stream chat (SSE, reasoning off) ----
-with open(os.path.join(BASE, "password")) as f:
-    password = f.read().strip()
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+site_pw = read_secret("password")
+kevin_pw = read_secret("kevin-password")
+failures = []
 
 
-def post_json(path, payload):
-    req = urllib.request.Request(
-        BASE_URL + path, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", **UA}, method="POST")
-    return opener.open(req, timeout=300)
+def check(name, cond):
+    print(("ok  " if cond else "FAIL") + "  " + name)
+    if not cond:
+        failures.append(name)
 
 
-t0 = time.time()
-r = post_json("/api/login", {"password": password})
-print("login:", r.status)
+# ---- 2. wrong site password -> 401 ----
+cj, op = new_client()
+r = post_json(op, "/api/login", {"password": "definitely-wrong"})
+check("wrong site password rejected (401)", r.status == 401)
 
-req = urllib.request.Request(
-    BASE_URL + "/api/chat/stream", data=json.dumps({"text": "test: this is the full context check."}).encode(),
-    headers={"Content-Type": "application/json", **UA}, method="POST")
-first_at = None
-n_delta = 0
-total_chars = 0
-done_seen = False
-reply = []
-with opener.open(req, timeout=300) as r:
-    print("stream: status", r.status)
-    buf = b""
-    while True:
-        chunk = r.read(512)
-        if not chunk:
-            break
-        if first_at is None:
-            first_at = time.time() - t0
-        buf += chunk
-        while b"\n\n" in buf:
-            evt, buf = buf.split(b"\n\n", 1)
-            for line in evt.split(b"\n"):
-                if not line.startswith(b"data:"):
-                    continue
-                obj = json.loads(line[5:].strip())
-                if obj.get("t") == "delta":
-                    if n_delta == 0:
-                        print(f"  first delta at {time.time()-t0:.1f}s")
-                    n_delta += 1
-                    total_chars += len(obj.get("text") or "")
-                    reply.append(obj.get("text") or "")
-                elif obj.get("t") == "done":
-                    done_seen = True
-full_reply = "".join(reply).strip()
-print(f"stream: {n_delta} deltas · {total_chars} chars · done={done_seen} · {time.time()-t0:.1f}s total")
-print("  reply:", full_reply[:200])
+# ---- 3. right site password -> 200, identity stage 'site' ----
+r = post_json(op, "/api/login", {"password": site_pw})
+check("site password accepted (200)", r.status == 200)
+r = get(op, "/api/session")
+check("session at identity stage 'site'",
+      r.status == 200 and json.loads(r.read())["identity"] == "site")
 
-# ---- 6. chat log on disk ----
-logs = sorted(os.listdir(os.path.join(BASE, "chats"))) if os.path.isdir(os.path.join(BASE, "chats")) else []
-print("vps chat logs:", logs)
-for name in logs[-1:]:
-    print("---", name, "tail ---")
-    for line in open(os.path.join(BASE, "chats", name)).read().strip().splitlines()[-6:]:
-        print(" ", line)
+# ---- 4. chat before identify -> 403 ----
+status, reply = stream_chat(op, "test")
+check("chat refused before identify (403)", status == 403)
 
-# ---- 7. rime tts still good + long-text no longer truncates ----
-r = post_json("/api/tts", {"text": "the whole house is behind the voice now.", "voice": "amarante", "provider": "rime"})
-data = r.read()
-print(f"tts rime/amarante: {r.status} · {len(data)}B · magic={data[:3].hex()}")
+# ---- 5. wrong kevin password -> 401, still 'site' ----
+r = post_json(op, "/api/identify", {"kevin": True, "password": "wrong"})
+check("wrong kevin password rejected (401)", r.status == 401)
+r = get(op, "/api/session")
+check("still 'site' after rejected identify",
+      r.status == 200 and json.loads(r.read())["identity"] == "site")
 
-long_text = "the water tower has been counting since 1895 and the room has the lights on. " * 18
-r = post_json("/api/tts", {"text": long_text, "voice": "amarante", "provider": "rime"})
-long_data = r.read()
-long_path = "/tmp/tts-long-check.mp3"
-open(long_path, "wb").write(long_data)
-probe = subprocess.run(
-    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", long_path],
-    capture_output=True, text=True)
-dur = float(probe.stdout.strip() or 0)
-print(f"tts long ({len(long_text)} chars): {r.status} · {len(long_data)}B · duration {dur:.1f}s "
-      f"(truncated if < 60s — was the [:400] cap bug)")
+# ---- 6. right kevin password -> 'kevin', full-snapshot chat works ----
+r = post_json(op, "/api/identify", {"kevin": True, "password": kevin_pw})
+check("kevin identify accepted (200)", r.status == 200)
+r = get(op, "/api/session")
+check("session is 'kevin'", r.status == 200 and json.loads(r.read())["identity"] == "kevin")
+status, reply = stream_chat(op, "verify: one short reply please.")
+check("kevin chat streams a reply", status == 200 and len(reply) > 10)
+print("  kevin reply:", reply[:90])
+full_ctx = any("context loaded: full snapshot" in l for l in tail_log(12))
+check("kevin session loaded the full snapshot", full_ctx)
+klog = os.path.join(BASE, "chats", "raw-" + time.strftime("%Y-%m-%d", time.gmtime()) + ".log")
+check("kevin chat logged to plain raw log", os.path.exists(klog) and "kevin:" in open(klog).read())
 
-# ---- 8. context line in talk.log ----
-for line in open(os.path.join(BASE, "talk.log")).read().strip().splitlines():
-    if "context loaded" in line or "context missing" in line:
-        print("talk.log:", line)
-print("done")
+# ---- 7. guest flow: identify guest -> lean prompt, guest-only log ----
+cj2, op2 = new_client()
+post_json(op2, "/api/login", {"password": site_pw})
+r = post_json(op2, "/api/identify", {"kevin": False})
+check("guest identify accepted (200)", r.status == 200)
+r = get(op2, "/api/session")
+check("session is 'guest'", r.status == 200 and json.loads(r.read())["identity"] == "guest")
+status, reply = stream_chat(op2, "hi, who are you? one short reply.")
+check("guest chat streams a reply", status == 200 and len(reply) > 10)
+print("  guest reply:", reply[:90])
+glog = os.path.join(BASE, "chats", "raw-" + time.strftime("%Y-%m-%d", time.gmtime()) + "-guest.log")
+check("guest chat logged to -guest file", os.path.exists(glog) and "guest:" in open(glog).read())
+klog_text = open(klog).read() if os.path.exists(klog) else ""
+check("guest lines stay out of the plain log", "guest:" not in klog_text)
+check("guest session did not load the full snapshot",
+      all("context loaded" not in l for l in tail_log(4)))
+
+print()
+if failures:
+    print("FAILURES:", failures)
+    sys.exit(1)
+print("all checks passed")

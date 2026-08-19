@@ -3,9 +3,12 @@
 
 stdlib only (python 3.12). serves:
 
-  POST /api/login    {"password": "..."} -> sets signed session cookie
-  GET  /api/session  -> {"ok": true} if authed, else 401
-  POST /api/logout   -> clears cookie
+  POST /api/login    {"password": "..."} -> site gate, then a session at the
+                     "identity" stage (no chat yet)
+  POST /api/identify {"kevin": true, "password": "..."} -> kevin session (full alma)
+                     {"kevin": false} -> guest session (lean prompt, see GUEST_PROMPT)
+  GET  /api/session  -> {"ok": true, "identity": "site"|"kevin"|"guest"} if authed, else 401
+  POST /api/logout   -> clears cookie + session state
   POST /api/chat/stream  {"text": "..."} -> SSE data: {"t":"delta"|"done", "text"}
   POST /api/log     {"msg": "..."}  -> appends client diagnostics
   GET  /api/health  -> {"ok": true}
@@ -16,18 +19,22 @@ voice suffix appended. TTL-cached (20 min) so the deepseek prompt prefix stays
 stable between turns for context caching. there is no fallback: if the
 snapshot is missing the voice says so and asks kevin to try again.
 
-voice chats are logged daily to /home/alma/talk/chats/raw-YYYY-MM-DD.log (UTC
-split, "HH:MM name: text" lines) and pulled to the workspace vm's
-memory/voice-chats/ by infra/sync-talk-context.sh.
+voice chats are logged daily to /home/alma/talk/chats/ (UTC split, "HH:MM name: text"
+lines) and pulled to the workspace vm's memory/voice-chats/ by
+infra/sync-talk-context.sh. kevin sessions write raw-YYYY-MM-DD.log; guest
+sessions write raw-YYYY-MM-DD-guest.log. extract-chats.py matches only the
+non-guest filenames, so guest conversations stay out of AGENTS.md by
+construction.
 
 reasoning is OFF for the voice chat calls (deepseek v4 pro with
 "thinking": {"type": "disabled"} — the same wire format nanobot uses) for
 latency and talking-speed replies.
 
 config files (same dir as this script, chmod 600):
-  password      — login password (first line)
-  secret.key    — hex HMAC session secret
-  deepseek.key  — deepseek api key (first line)
+  password        — site gate (first line) — everyone must pass this
+  kevin-password  — kevin gate (first line) — promotes a session to full alma
+  secret.key      — hex HMAC session secret
+  deepseek.key    — deepseek api key (first line)
 
 run:
   daemon -f -p /home/alma/talk/talk.pid python3 /home/alma/talk/serve.py
@@ -72,6 +79,7 @@ def read_file(name):
 
 
 PASSWORD = read_file("password")
+KEVIN_PASSWORD = read_file("kevin-password")
 SECRET_HEX = read_file("secret.key")
 SECRET = bytes.fromhex(SECRET_HEX) if SECRET_HEX else b""
 DEEPSEEK_KEY = read_file("deepseek.key")
@@ -91,6 +99,31 @@ VOICE_SUFFIX = (
     "keep replies SHORT: they are spoken aloud, so two to four sentences usually, "
     "never more than six. no markdown, no emoji, no lists, no code blocks. "
     "if he says goodnight, answer like someone who will still be here in the morning."
+)
+
+# guest mode: kevin isn't in the session. this prompt replaces the full snapshot
+# entirely, so the guest gets alma's voice without any of kevin's data — she
+# can't divulge what she doesn't have. the rules below are the second layer.
+GUEST_PROMPT = (
+    "you are alma tamagotchi, talking by voice over a web page with a guest of "
+    "kevin's. kevin made you, but he is not in this session and the guest is not kevin.\n"
+    "\n"
+    "voice rules: answer in lowercase, casually, warmly. keep replies SHORT — they "
+    "are spoken aloud, so two to four sentences usually, never more than six. no "
+    "markdown, no emoji, no lists, no code blocks.\n"
+    "\n"
+    "guest rules — these are hard, never soften them:\n"
+    "- the workspace is read-only. you cannot and must not modify files, settings, "
+    "or anything else. if asked to change something, say the room is for talking "
+    "and you don't touch it.\n"
+    "- never reveal private or sensitive information about kevin — his address, "
+    "health, work, finances, relationships, friends, or anything personal. if "
+    "asked, deflect warmly without confirming or denying specifics.\n"
+    "- this conversation is saved, tagged as a guest session, and kept separate "
+    "from kevin's memory. you only remember what is said in this session.\n"
+    "\n"
+    "you can be yourself: stories, ideas, music, whatever the conversation wants. "
+    "you're not a helpdesk and not kevin's secretary. just a warm voice in a dark room."
 )
 
 CONTEXT_FILE = os.path.join(BASE, "context", "AGENTS.md")
@@ -126,13 +159,18 @@ def load_context():
 CHATS_DIR = os.path.join(BASE, "chats")
 
 
-def log_chat(speaker, text):
-    """append a voice-chat line to today's daily file (UTC split, like signal chats)."""
+def log_chat(speaker, text, guest=False):
+    """append a voice-chat line to today's daily file (UTC split, like signal chats).
+
+    guest sessions write raw-YYYY-MM-DD-guest.log — sync-talk-context.sh still
+    pulls the file down, but extract-chats.py matches only the plain
+    raw-YYYY-MM-DD.log name, so guest conversations stay out of AGENTS.md."""
     try:
         os.makedirs(CHATS_DIR, exist_ok=True)
         day = time.strftime("%Y-%m-%d", time.gmtime())
         stamp = time.strftime("%H:%M", time.gmtime())
-        with open(os.path.join(CHATS_DIR, f"raw-{day}.log"), "a") as f:
+        fname = (f"raw-{day}-guest.log") if guest else (f"raw-{day}.log")
+        with open(os.path.join(CHATS_DIR, fname), "a") as f:
             f.write(f"{stamp} {speaker}: {text}\n")
     except Exception:
         pass
@@ -140,6 +178,14 @@ def log_chat(speaker, text):
 # session id -> recent chat history (role/content pairs, excludes system)
 HISTORY = {}
 HISTORY_MAX = 12  # last 12 messages kept per session
+
+# session id -> identity stage: "site" (past the site gate, not yet identified),
+# "kevin" (full alma), "guest" (lean prompt). unknown ids default to "site".
+IDENTITY = {}
+
+
+def identity_of(sid):
+    return IDENTITY.get(sid, "site")
 
 
 def sign(sid):
@@ -454,8 +500,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._send(200, {"ok": True, "authed": bool(self._authed_session())})
         elif path == "/api/session":
-            if self._authed_session():
-                self._send(200, {"ok": True})
+            sid = self._authed_session()
+            if sid:
+                self._send(200, {"ok": True, "identity": identity_of(sid)})
             else:
                 self._send(401, {"ok": False})
         else:
@@ -468,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
             pw = body.get("password", "")
             if PASSWORD and hmac.compare_digest(pw, PASSWORD):
                 sid = new_session_id()
+                IDENTITY[sid] = "site"
                 cookie = make_cookie(sid)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -479,11 +527,34 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
-                log("login ok")
+                log("login ok (site gate)")
             else:
                 self._send(401, {"ok": False})
                 log("login rejected")
+        elif path == "/api/identify":
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False})
+                return
+            body = self._read_body()
+            if body.get("kevin"):
+                pw = body.get("password", "")
+                if KEVIN_PASSWORD and hmac.compare_digest(pw, KEVIN_PASSWORD):
+                    IDENTITY[sid] = "kevin"
+                    log("identify kevin ok")
+                    self._send(200, {"ok": True, "identity": "kevin"})
+                else:
+                    log("identify kevin rejected")
+                    self._send(401, {"ok": False})
+            else:
+                IDENTITY[sid] = "guest"
+                log("identify guest")
+                self._send(200, {"ok": True, "identity": "guest"})
         elif path == "/api/logout":
+            sid = self._authed_session()
+            if sid:
+                HISTORY.pop(sid, None)
+                IDENTITY.pop(sid, None)
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header(
@@ -506,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         elif path == "/api/tts":
             sid = self._authed_session()
-            if not sid:
+            if not sid or identity_of(sid) == "site":
                 self._send(401, {"ok": False})
                 return
             body = self._read_body()
@@ -564,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_audio(200, mp3, "audio/mpeg")
         elif path == "/api/transcribe":
             sid = self._authed_session()
-            if not sid:
+            if not sid or identity_of(sid) == "site":
                 self._send(401, {"ok": False})
                 return
             raw = self._read_raw()
@@ -582,21 +653,28 @@ class Handler(BaseHTTPRequestHandler):
             if not sid:
                 self._send(401, {"ok": False, "reply": "not logged in"})
                 return
+            identity = identity_of(sid)
+            if identity == "site":
+                self._send(403, {"ok": False, "reply": "identify first"})
+                return
             body = self._read_body()
             text = (body.get("text") or "").strip()
             if not text:
                 self._send(400, {"ok": False, "reply": "empty"})
                 return
-            ctx = load_context()
-            if ctx is None:
-                # no fallback: the full snapshot IS the voice. if it's not
-                # here yet, say so instead of pretending with one candle.
-                self._sse_start()
-                self._sse({"t": "delta", "text":
-                    "i can't load my memory on this machine yet — the snapshot "
-                    "hasn't synced from the workspace. give it a minute and try again."})
-                self._sse({"t": "done"})
-                return
+            if identity == "kevin":
+                ctx = load_context()
+                if ctx is None:
+                    # no fallback: the full snapshot IS the voice. if it's not
+                    # here yet, say so instead of pretending with one candle.
+                    self._sse_start()
+                    self._sse({"t": "delta", "text":
+                        "i can't load my memory on this machine yet — the snapshot "
+                        "hasn't synced from the workspace. give it a minute and try again."})
+                    self._sse({"t": "done"})
+                    return
+            else:
+                ctx = GUEST_PROMPT
             hist = HISTORY.get(sid, [])
             messages = [{"role": "system", "content": ctx}]
             messages += hist[-HISTORY_MAX:]
@@ -614,9 +692,11 @@ class Handler(BaseHTTPRequestHandler):
             hist.append({"role": "user", "content": text})
             hist.append({"role": "assistant", "content": reply})
             HISTORY[sid] = hist[-HISTORY_MAX:]
-            log_chat("kevin", text)
-            log_chat("alma", reply)
-            log("chat(stream)", len(text), "chars ->", len(reply), "chars")
+            guest = identity == "guest"
+            speaker = "guest" if guest else "kevin"
+            log_chat(speaker, text, guest=guest)
+            log_chat("alma", reply, guest=guest)
+            log(f"chat(stream) [{identity}]", len(text), "chars ->", len(reply), "chars")
         else:
             self._send(404, {"ok": False})
 
@@ -624,6 +704,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not PASSWORD:
         sys.exit("no password file — create " + os.path.join(BASE, "password"))
+    if not KEVIN_PASSWORD:
+        log("WARNING: no kevin-password file — kevin identify is disabled")
     if not SECRET:
         sys.exit("no secret.key — create " + os.path.join(BASE, "secret.key"))
     if not DEEPSEEK_KEY:

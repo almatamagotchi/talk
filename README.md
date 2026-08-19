@@ -33,8 +33,9 @@ lighttpd  talk.almatamagotchi.com
 
 | method | path | what |
 |---|---|---|
-| POST | `/api/login` | `{"password": "..."}` → sets a signed session cookie (HMAC, HttpOnly, Secure, SameSite=Lax) |
-| GET | `/api/session` | `{"ok": true}` if authed, else 401 |
+| POST | `/api/login` | `{"password": "..."}` → site gate; session starts at the identity stage |
+| POST | `/api/identify` | `{"kevin": true, "password": "..."}` → kevin session (full alma) · `{"kevin": false}` → guest session |
+| GET | `/api/session` | `{"ok": true, "identity": "site"\|kevin\|guest"}` if authed, else 401 |
 | POST | `/api/logout` | clears the cookie |
 | POST | `/api/chat/stream` | `{"text": "..."}` → SSE `data: {"t":"delta"|"done", "text"}` — the only chat path (no fallback) |
 | POST | `/api/tts` | `{"text": "..."}` → mp3 bytes (azure `en-US-JennyNeural` via edge-tts, free, no key) |
@@ -42,8 +43,21 @@ lighttpd  talk.almatamagotchi.com
 | POST | `/api/log` | `{"msg": "..."}` → appends browser-side diagnostics to the server log |
 | GET | `/api/health` | `{"ok": true}` |
 
-auth: everything except login/health requires the session cookie, checked
-per request. wrong password or no cookie → 401.
+auth: two stages. the site password (`password` file) opens the door, then the
+page asks "are you kevin?" — the kevin password (`kevin-password` file)
+promotes the session to full alma, and "no" gives a guest session.
+chat/tts/transcribe require an identified session (kevin or guest); wrong
+password or no cookie → 401.
+
+two kinds of session:
+
+- **kevin** — full context (the AGENTS.md snapshot synced from the workspace
+  vm), logged to `chats/raw-YYYY-MM-DD.log`, loaded into the agents file.
+- **guest** — lean prompt only (GUEST_PROMPT in serve.py): alma's voice with
+  no kevin data loaded, workspace treated as read-only, no private info
+  about kevin, ever. logged to `chats/raw-YYYY-MM-DD-guest.log` — pulled down
+  like the other logs but excluded from AGENTS.md by the extraction pipeline
+  (it only matches the plain `raw-YYYY-MM-DD.log` name).
 
 ## device matrix
 
@@ -83,7 +97,8 @@ heard whisper-style.
 
 | file | what |
 |---|---|
-| `/home/alma/talk/password` | the login password, first line |
+| `/home/alma/talk/password` | the site gate password, first line |
+| `/home/alma/talk/kevin-password` | the kevin gate password, first line |
 | `/home/alma/talk/secret.key` | hex HMAC session secret |
 | `/home/alma/talk/deepseek.key` | deepseek api key |
 
@@ -149,8 +164,15 @@ docroot) and the snapshot pushed to the VPS (`context/AGENTS.md`) is mode 600.
   restart the backend and short-term memory resets
 - the voice loads the full snapshot — no compact persona, no fallback
 
-## changing the password
+## changing the passwords
+
+two files, both first-line, both chmod 600:
 
 ```
-echo "new-password-here" > /home/alma/talk/password && chmod 600 /home/alma/talk/password
+echo "new-site-password-here" > /home/alma/talk/password && chmod 600 /home/alma/talk/password
+echo "new-kevin-password-here" > /home/alma/talk/kevin-password && chmod 600 /home/alma/talk/kevin-password
 ```
+
+restart the backend after a change (or wait for the next reboot — the
+@reboot cron starts it). `python3 verify-full.py` restarts it and checks the
+whole two-stage flow end to end.

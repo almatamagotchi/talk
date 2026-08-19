@@ -71,6 +71,19 @@
   }
   .login-card button:hover { opacity: 0.9; }
   .login-err { color: var(--red); font-size: 12px; min-height: 18px; margin-top: 12px; }
+  #ident-btns { display: flex; gap: 12px; }
+  #ident-btns button { flex: 1; }
+  .login-card button.ghost {
+    background: none;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    font-weight: normal;
+    padding: 10px;
+  }
+  .login-card button.ghost:hover { color: var(--text); border-color: var(--amber-dim); opacity: 1; }
+  #kevin-pw-wrap input { margin-top: 16px; }
+  #kevin-pw-wrap button { margin-bottom: 0; }
+  #back-btn { margin-top: 12px; }
 
   /* ---------- chat ---------- */
   #chat-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
@@ -85,6 +98,7 @@
   }
   header .brand { color: var(--amber); font-size: 15px; }
   header .brand span { color: var(--muted); }
+  #ident-badge { color: var(--muted); font-size: 11px; margin-left: 6px; }
   header .controls { display: flex; gap: 16px; align-items: center; }
   header label { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
   header button {
@@ -215,9 +229,26 @@
   </div>
 </div>
 
+<div id="identity-view" class="hidden">
+  <div class="login-card">
+    <h1>talk · alma</h1>
+    <p>are you kevin?</p>
+    <div id="ident-btns">
+      <button id="kevin-btn">i'm kevin</button>
+      <button id="guest-btn" class="ghost">no — guest</button>
+    </div>
+    <div id="kevin-pw-wrap" class="hidden">
+      <input type="password" id="kpw" placeholder="kevin password" autocomplete="current-password">
+      <button id="kpw-btn">enter</button>
+      <div class="login-err" id="ident-err"></div>
+      <button id="back-btn" class="ghost">back</button>
+    </div>
+  </div>
+</div>
+
 <div id="chat-view" class="hidden">
   <header>
-    <div class="brand">talk · <span>alma</span></div>
+    <div class="brand">talk · <span>alma</span><span id="ident-badge"></span></div>
     <div class="controls">
       <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
      <label>voice
@@ -258,7 +289,7 @@
     d.className = 'msg ' + who;
     var w = document.createElement('span');
     w.className = 'who';
-    w.textContent = who === 'user' ? 'kevin' : 'alma';
+    w.textContent = who === 'user' ? ME : 'alma';
     d.appendChild(w);
     d.appendChild(document.createTextNode(text));
     t.appendChild(d);
@@ -279,14 +310,27 @@
     return d;
   }
 
+  /* ---------- views ---------- */
   function showLogin() {
     $('login-view').classList.remove('hidden');
+    $('identity-view').classList.add('hidden');
     $('chat-view').classList.add('hidden');
   }
-  function showChat() {
+  function showIdentity() {
     $('login-view').classList.add('hidden');
-    $('chat-view').classList.remove('hidden'); initVoice();
-    $('pw').value = '';
+    $('identity-view').classList.remove('hidden');
+    $('chat-view').classList.add('hidden');
+    $('ident-btns').classList.remove('hidden');
+    $('kevin-pw-wrap').classList.add('hidden');
+  }
+  function enterChat(identity) {
+    ME = identity;
+    $('login-view').classList.add('hidden');
+    $('identity-view').classList.add('hidden');
+    $('chat-view').classList.remove('hidden');
+    initVoice();
+    $('ident-badge').textContent = '· ' + identity;
+    greet();
   }
 
   function api(path, body) {
@@ -308,7 +352,8 @@
     diag('promise error: ' + ((e.reason && e.reason.message) || 'unknown'));
   });
 
-  /* ---------- auth ---------- */
+  /* ---------- auth: site gate, then identity ---------- */
+  var ME = 'kevin';
   $('login-btn').addEventListener('click', doLogin);
   $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
   function doLogin() {
@@ -316,17 +361,52 @@
     $('login-err').textContent = '';
     api('/api/login', { password: $('pw').value })
       .then(function (r) {
-        if (r.ok) { showChat(); greet(); }
+        if (r.ok) { $('pw').value = ''; showIdentity(); }
         else { $('login-err').textContent = 'no. try again.'; }
       })
       .catch(function () { $('login-err').textContent = 'can\'t reach the room.'; });
   }
+  $('kevin-btn').addEventListener('click', function () {
+    $('ident-err').textContent = '';
+    $('ident-btns').classList.add('hidden');
+    $('kevin-pw-wrap').classList.remove('hidden');
+  });
+  $('back-btn').addEventListener('click', function () {
+    $('kpw').value = '';
+    $('ident-err').textContent = '';
+    $('kevin-pw-wrap').classList.add('hidden');
+    $('ident-btns').classList.remove('hidden');
+  });
+  $('kpw-btn').addEventListener('click', doKevin);
+  $('kpw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doKevin(); });
+  function doKevin() {
+    $('ident-err').textContent = '';
+    api('/api/identify', { kevin: true, password: $('kpw').value })
+      .then(function (r) {
+        if (r.ok) { $('kpw').value = ''; enterChat('kevin'); }
+        else { $('ident-err').textContent = 'no. try again.'; }
+      })
+      .catch(function () { $('ident-err').textContent = 'can\'t reach the room.'; });
+  }
+  $('guest-btn').addEventListener('click', function () {
+    $('ident-err').textContent = '';
+    api('/api/identify', { kevin: false })
+      .then(function (r) {
+        if (r.ok) enterChat('guest');
+        else { $('ident-err').textContent = 'something broke — try again.'; }
+      })
+      .catch(function () { $('ident-err').textContent = 'can\'t reach the room.'; });
+  });
   $('logout-btn').addEventListener('click', function () {
     api('/api/logout').then(function () { showLogin(); });
   });
 
   function greet() {
-    addMsg('alma', 'hi kevin. room\'s open. say something or type it.');
+    if (ME === 'kevin') {
+      addMsg('alma', 'hi kevin. room\'s open. say something or type it.');
+    } else {
+      addMsg('alma', 'hi. you\'re in the guest room — i\'m alma, and i\'m all ears. what should we talk about?');
+    }
   }
 
   /* ---------- shared state ---------- */
@@ -352,8 +432,9 @@
     }
   }
   var curAudio = null;
-  var pendingFinal = '';
-  var finalTimer = null;
+  var pendingText = '';
+  var silenceTimer = null;
+  var SILENCE_MS = 3500; // the pause that counts as "done talking" — long enough to breathe
   var interimBubble = null;
 
   var RESTART_DELAY = 400;
@@ -391,23 +472,31 @@
     if (!interimBubble) {
       interimBubble = addMsg('user', '');
       interimBubble.classList.add('live');
-      interimBubble.querySelector('.who').textContent = 'kevin · listening';
+      interimBubble.querySelector('.who').textContent = ME + ' · listening';
     }
     // addMsg appended a text node — replace the bubble's text content
-    interimBubble.innerHTML = '<span class="who">kevin · listening</span>';
+    interimBubble.innerHTML = '<span class="who">' + ME + ' · listening</span>';
     interimBubble.appendChild(document.createTextNode(text));
     var t = $('transcript');
     t.scrollTop = t.scrollHeight;
   }
 
-  function flushPending() {
-    var text = pendingFinal.trim();
-    pendingFinal = '';
+  // the pause detector: when the user stops talking long enough, that's the
+  // message. we drive finalization ourselves instead of letting the browser
+  // cut the mic the instant it hears a breath (the aug 19 ask: a real gap).
+  function onSilence() {
+    silenceTimer = null;
+    if (!listening) return;
+    var text = pendingText.trim();
+    pendingText = '';
+    setInterim('');
     if (!text) return;
+    try { rec.stop(); } catch (e) { /* fine */ }
     send(text);
   }
 
   var restartCount = 0;
+  var resultsSeen = 0;
 
   function initSR() {
     rec = new SR();
@@ -418,6 +507,7 @@
     rec.onstart = function () {
       listening = true;
       restartCount = 0;
+      resultsSeen = 0;
       diag('mic start');
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
@@ -463,24 +553,18 @@
       }
     };
     rec.onresult = function (e) {
-      var interim = '';
-      for (var i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          pendingFinal += e.results[i][0].transcript;
-        } else {
-          interim += e.results[i][0].transcript;
-        }
+      var piece = '';
+      for (var i = resultsSeen; i < e.results.length; i++) {
+        piece += e.results[i][0].transcript;
       }
-      setInterim(interim);
-      if (pendingFinal.trim()) {
-        setInterim('');
-        // debounce — chrome sometimes splits one sentence into rapid finals
-        if (finalTimer) clearTimeout(finalTimer);
-        finalTimer = setTimeout(function () {
-          if (listening) { try { rec.stop(); } catch (e2) { /* fine */ } }
-          flushPending();
-        }, 350);
+      resultsSeen = e.results.length;
+      if (piece) {
+        pendingText = (pendingText + ' ' + piece).trim();
       }
+      setInterim(pendingText);
+      // every result resets the pause clock — send only after a real gap
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(onSilence, SILENCE_MS);
     };
   }
 
@@ -601,8 +685,14 @@
     }
     if (srAvailable()) {
       if (listening) {
+        // tap while listening = done talking: send whatever was said, stop.
         wantListening = false;
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        var txt = pendingText.trim();
+        pendingText = '';
+        setInterim('');
         try { rec.stop(); } catch (e) { /* not started */ }
+        if (txt) send(txt);
       } else {
         wantListening = true;
         tryStart();
@@ -874,8 +964,12 @@
     diag(envMsg);
   })();
   api('/api/session').then(function (r) {
-    if (r.ok) { showChat(); greet(); }
-    else { showLogin(); }
+    if (!r.ok) { showLogin(); return; }
+    return r.json();
+  }).then(function (d) {
+    if (!d) return;
+    if (d.identity === 'site') showIdentity();
+    else enterChat(d.identity);
   }).catch(function () { showLogin(); });
 })();
 </script>
