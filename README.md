@@ -38,7 +38,7 @@ lighttpd  talk.almatamagotchi.com
 | GET | `/api/session` | `{"ok": true, "identity": "site"\|kevin\|guest"}` if authed, else 401 |
 | POST | `/api/logout` | clears the cookie |
 | POST | `/api/chat/stream` | `{"text": "..."}` → SSE `data: {"t":"delta"|"done", "text"}` — the only chat path (no fallback) |
-| POST | `/api/tts` | `{"text": "..."}` → mp3 bytes (azure `en-US-JennyNeural` via edge-tts, free, no key) |
+| POST | `/api/tts` | `{"text": "...", "voice": "jenny", "provider": "edge"}` → mp3 bytes. default azure `en-US-JennyNeural` via edge-tts (free, no key); `provider: "rime"` switches to the rime coda neural voices. `voice` is validated against allowlists — arbitrary input never reaches a tts provider |
 | POST | `/api/transcribe` | raw 16k mono wav body → `{"text": "..."}` via whisper.cpp (`base.en`) |
 | POST | `/api/log` | `{"msg": "..."}` → appends browser-side diagnostics to the server log |
 | GET | `/api/health` | `{"ok": true}` |
@@ -98,6 +98,22 @@ heard whisper-style.
 | `index.html` | the whole frontend: password gate, mic button, live interim transcript, recorder fallback, text input, device-capability line |
 | `talk-host.conf` | lighttpd host block (append to `/usr/local/etc/lighttpd/lighttpd.conf`) |
 | `verify.sh` | end-to-end smoke check against the live host |
+| `verify-full.py` | restarts the backend and walks the whole two-stage flow (kevin full-snapshot load, guest session, guest-log isolation) — 18 checks |
+| `verify-rime.py` | rime tts round trips + sample clip checks |
+
+## voices
+
+the frontend has a picker (persisted as `talk-voice`) — seven edge-tts
+voices plus two rime voices, all validated server-side against allowlists
+and silently falling back to jenny on anything unknown:
+
+- **edge-tts** (azure neural, free, no key): jenny (default), aria, ava,
+  emma, michelle, andrew, brian
+- **rime** (coda model, `creds/rime.key` on the vm / `rime.key` on the VPS,
+  never committed): amarante, and **alma** — the coda catalog has a voice
+  literally named alma. A/B sample clips live at
+  `talk.almatamagotchi.com/samples/` (same three lines per voice, so they
+  compare fairly)
 
 ## backend config (on the VPS, chmod 600, never committed)
 
@@ -107,6 +123,7 @@ heard whisper-style.
 | `/home/alma/talk/kevin-password` | the kevin gate password, first line |
 | `/home/alma/talk/secret.key` | hex HMAC session secret |
 | `/home/alma/talk/deepseek.key` | deepseek api key |
+| `/home/alma/talk/rime.key` | rime api key (coda neural voices) |
 
 ## running it
 
@@ -158,6 +175,14 @@ exchange is appended to a private daily file at
 "HH:MM name: text" lines, mode 600 dir) and pulled into the workspace vm's
 `memory/voice-chats/` by `infra/sync-talk-context.sh`, so voice conversations
 join the memory system and show up in the AGENTS.md `[voice-chats]` section.
+the voice remembers — and so does the rest of alma.
+- **the near-miss, and the guard.** the first version of the pull extracted
+the VPS chats dir into `memory/chats/`, overwriting that night's signal
+conversation log (recovered from the session log, but not before a scare).
+since then `sync-talk-context.sh` carries a hard invariant guard: if
+`LOCAL_CHATS` is ever edited away from `memory/voice-chats/`, the script
+aborts instead of pulling. the pull must never touch `memory/chats/` — that
+rule is enforced by the script, not by memory.
 - `talk.log` still records event lengths, and browser diagnostics go to
 `/api/log` as telemetry, not transcripts.
 - nothing in the chats dir is ever served by lighttpd (it lives outside the
