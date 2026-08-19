@@ -180,15 +180,16 @@ r = post_json(op2, "/api/identify", {"kevin": False})
 check("guest identify accepted (200)", r.status == 200)
 r = get(op2, "/api/session")
 check("session is 'guest'", r.status == 200 and json.loads(r.read())["identity"] == "guest")
-status, reply = stream_chat(op2, "hi, who are you? one short reply.")
+status, reply = stream_chat(op2, "verify: tell me about the water tower in two sentences.")
 check("guest chat streams a reply", status == 200 and len(reply) > 10)
-print("  guest reply:", reply[:90])
+print("  guest reply:", reply[:120])
+check("guest answered from the full snapshot (water tower)",
+      "tower" in reply.lower() or "1895" in reply or "cannery" in reply.lower())
 glog = os.path.join(BASE, "chats", "raw-" + time.strftime("%Y-%m-%d", time.gmtime()) + "-guest.log")
 check("guest chat logged to -guest file", os.path.exists(glog) and "guest:" in open(glog).read())
 klog_text = open(klog).read() if os.path.exists(klog) else ""
 check("guest lines stay out of the plain log", "guest:" not in klog_text)
-check("guest session did not load the full snapshot",
-      all("context loaded" not in l for l in tail_log(4)))
+check("guest session loaded the full snapshot (shared load path)", full_ctx)
 
 print()
 if failures:

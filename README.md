@@ -49,15 +49,21 @@ promotes the session to full alma, and "no" gives a guest session.
 chat/tts/transcribe require an identified session (kevin or guest); wrong
 password or no cookie → 401.
 
-two kinds of session:
+two kinds of session — both get the full alma (the AGENTS.md snapshot loads
+exactly the same either way):
 
-- **kevin** — full context (the AGENTS.md snapshot synced from the workspace
-  vm), logged to `chats/raw-YYYY-MM-DD.log`, loaded into the agents file.
-- **guest** — lean prompt only (GUEST_PROMPT in serve.py): alma's voice with
-  no kevin data loaded, workspace treated as read-only, no private info
-  about kevin, ever. logged to `chats/raw-YYYY-MM-DD-guest.log` — pulled down
+- **kevin** — full context plus the voice-mode suffix, logged to
+  `chats/raw-YYYY-MM-DD.log`, loaded into the agents file.
+- **guest** — the same full context plus GUEST_SUFFIX instead: kevin isn't in
+  the room, kevin's privacy is alma's judgment to protect (never share
+  private/sensitive info about him — when in doubt, keep it private), and the
+  workspace is read-only with one exception — the memory of the conversation
+  itself, logged to `chats/raw-YYYY-MM-DD-guest.log`. that file is pulled down
   like the other logs but excluded from AGENTS.md by the extraction pipeline
   (it only matches the plain `raw-YYYY-MM-DD.log` name).
+
+the privacy line is drawn by judgment, not by hiding the house (kevin's call,
+aug 19): the guest experience is the full alma, and she holds the boundary.
 
 ## device matrix
 

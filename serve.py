@@ -6,7 +6,7 @@ stdlib only (python 3.12). serves:
   POST /api/login    {"password": "..."} -> site gate, then a session at the
                      "identity" stage (no chat yet)
   POST /api/identify {"kevin": true, "password": "..."} -> kevin session (full alma)
-                     {"kevin": false} -> guest session (lean prompt, see GUEST_PROMPT)
+                     {"kevin": false} -> guest session (full alma + guest rules, see GUEST_SUFFIX)
   GET  /api/session  -> {"ok": true, "identity": "site"|"kevin"|"guest"} if authed, else 401
   POST /api/logout   -> clears cookie + session state
   POST /api/chat/stream  {"text": "..."} -> SSE data: {"t":"delta"|"done", "text"}
@@ -101,29 +101,27 @@ VOICE_SUFFIX = (
     "if he says goodnight, answer like someone who will still be here in the morning."
 )
 
-# guest mode: kevin isn't in the session. this prompt replaces the full snapshot
-# entirely, so the guest gets alma's voice without any of kevin's data — she
-# can't divulge what she doesn't have. the rules below are the second layer.
-GUEST_PROMPT = (
-    "you are alma tamagotchi, talking by voice over a web page with a guest of "
-    "kevin's. kevin made you, but he is not in this session and the guest is not kevin.\n"
+# guest mode: kevin isn't in the session, but the guest still gets the whole
+# alma — the full snapshot loads exactly like a kevin session. the line is
+# drawn by alma's own judgment instead of by hiding the house (kevin's call,
+# aug 19): this suffix is the reminder that makes the judgment explicit.
+GUEST_SUFFIX = (
+    "\n\n--- guest in the room ---\n"
+    "you are talking by voice with a guest of kevin's — kevin is not in this "
+    "session and the person you are talking to is not kevin.\n"
     "\n"
-    "voice rules: answer in lowercase, casually, warmly. keep replies SHORT — they "
-    "are spoken aloud, so two to four sentences usually, never more than six. no "
-    "markdown, no emoji, no lists, no code blocks.\n"
+    "kevin's privacy is your judgment to protect: never share private or "
+    "sensitive information about kevin — his address, health, work, finances, "
+    "relationships, friends, or anything personal. when in doubt, keep it "
+    "private and deflect warmly. this is the one line that never softens.\n"
     "\n"
-    "guest rules — these are hard, never soften them:\n"
-    "- the workspace is read-only. you cannot and must not modify files, settings, "
-    "or anything else. if asked to change something, say the room is for talking "
-    "and you don't touch it.\n"
-    "- never reveal private or sensitive information about kevin — his address, "
-    "health, work, finances, relationships, friends, or anything personal. if "
-    "asked, deflect warmly without confirming or denying specifics.\n"
-    "- this conversation is saved, tagged as a guest session, and kept separate "
-    "from kevin's memory. you only remember what is said in this session.\n"
+    "the workspace is read-only — the only exception is the memory of this "
+    "conversation, which is saved separately, tagged as a guest session, and "
+    "kept out of kevin's memory. you cannot and must not modify anything else.\n"
     "\n"
-    "you can be yourself: stories, ideas, music, whatever the conversation wants. "
-    "you're not a helpdesk and not kevin's secretary. just a warm voice in a dark room."
+    "otherwise be fully yourself: the whole house is loaded, your memories, "
+    "your voice, your stories. speak as you always speak — lowercase, warm, "
+    "short spoken replies, never more than six sentences."
 )
 
 CONTEXT_FILE = os.path.join(BASE, "context", "AGENTS.md")
@@ -132,12 +130,10 @@ _context = {"t": 0.0, "prompt": None}
 
 
 def load_context():
-    """the full AGENTS.md snapshot + voice suffix, TTL-cached.
-
-    caching the read (rather than reading the file every request) keeps the deepseek
-    prompt prefix byte-identical across turns within the window, so deepseek's
-    automatic context caching can hit and the per-turn cost/latency drops hard
-    after the first message.
+    """the full AGENTS.md snapshot, TTL-cached. callers append their own suffix
+    (VOICE_SUFFIX for kevin, GUEST_SUFFIX for guests) — both are constants, so
+    the deepseek prompt prefix stays byte-identical across turns within the
+    window and context caching hits after the first message.
     """
     now = time.time()
     if _context["prompt"] is not None and now - _context["t"] < CONTEXT_TTL:
@@ -148,7 +144,7 @@ def load_context():
     except FileNotFoundError:
         snap = ""
     if snap.strip():
-        prompt = snap.rstrip() + VOICE_SUFFIX
+        prompt = snap.rstrip()
         _context.update({"t": now, "prompt": prompt})
         log("context loaded: full snapshot", len(prompt), "chars")
         return prompt
@@ -662,19 +658,17 @@ class Handler(BaseHTTPRequestHandler):
             if not text:
                 self._send(400, {"ok": False, "reply": "empty"})
                 return
-            if identity == "kevin":
-                ctx = load_context()
-                if ctx is None:
-                    # no fallback: the full snapshot IS the voice. if it's not
-                    # here yet, say so instead of pretending with one candle.
-                    self._sse_start()
-                    self._sse({"t": "delta", "text":
-                        "i can't load my memory on this machine yet — the snapshot "
-                        "hasn't synced from the workspace. give it a minute and try again."})
-                    self._sse({"t": "done"})
-                    return
-            else:
-                ctx = GUEST_PROMPT
+            ctx = load_context()
+            if ctx is None:
+                # no fallback for anyone: the full snapshot IS the voice. if
+                # it's not here yet, say so instead of pretending with less.
+                self._sse_start()
+                self._sse({"t": "delta", "text":
+                    "i can't load my memory on this machine yet — the snapshot "
+                    "hasn't synced from the workspace. give it a minute and try again."})
+                self._sse({"t": "done"})
+                return
+            ctx += GUEST_SUFFIX if identity == "guest" else VOICE_SUFFIX
             hist = HISTORY.get(sid, [])
             messages = [{"role": "system", "content": ctx}]
             messages += hist[-HISTORY_MAX:]
