@@ -460,10 +460,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _send_audio(self, code, data, ctype):
+    def _send_audio(self, code, data, ctype, extra=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
@@ -582,16 +584,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False})
                 return
             voice = resolve_voice(body.get("voice"))
+            requested = (body.get("voice") or "").strip().lower()
+            fell_back = False
             provider = (body.get("provider") or "").strip().lower()
             if provider == "rime":
                 if not RIME_KEY:
                     log("tts rime requested but no rime.key")
                     self._send(502, {"ok": False})
                     return
-                speaker = RIME_VOICES.get(voice, "amarante")
+                # rime has its own shelf (amarante, alma). resolve against it
+                # directly — routing through the edge VOICES map first was
+                # silently speaking amarante when 'alma' was requested.
+                if requested in RIME_VOICES:
+                    speaker = RIME_VOICES[requested]
+                else:
+                    fell_back = True
+                    speaker = "amarante"
                 gen = lambda t: rime_tts(t, speaker=speaker)
                 voice_label = "rime/" + speaker
             else:
+                if requested and requested not in VOICES:
+                    fell_back = True
                 gen = lambda t: edge_tts(t, voice=voice)
                 voice_label = voice
             # long replies hit the providers' input caps (~500 chars) and got
@@ -628,7 +641,13 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
             log("tts", len(text), "chars, ", len(chunks), "chunk(s), ", voice_label, "->", len(mp3), "bytes")
-            self._send_audio(200, mp3, "audio/mpeg")
+            # tell the page exactly which voice spoke, and whether the
+            # requested one was unavailable — kevin is a/b-testing voices
+            # and the fallback must never be silent.
+            self._send_audio(200, mp3, "audio/mpeg", extra={
+                "X-Resolved-Voice": voice_label,
+                "X-Voice-Fell-Back": "1" if fell_back else "0",
+            })
         elif path == "/api/transcribe":
             sid = self._authed_session()
             if not sid or identity_of(sid) == "site":
