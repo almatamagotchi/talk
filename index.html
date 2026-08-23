@@ -28,7 +28,8 @@
   .hidden { display: none !important; }
 
   /* ---------- login ---------- */
-  #login-view {
+  #login-view,
+  #identity-view {
     flex: 1;
     display: flex;
     align-items: center;
@@ -85,6 +86,19 @@
   #kevin-pw-wrap button { margin-bottom: 0; }
   #back-btn { margin-top: 12px; }
 
+  .replay-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 1px 6px;
+    margin-left: 6px;
+    opacity: 0.5;
+    vertical-align: baseline;
+  }
+  .replay-btn:hover { opacity: 1; color: var(--amber); }
+
   /* ---------- chat ---------- */
   #chat-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   header {
@@ -101,6 +115,24 @@
   #ident-badge { color: var(--muted); font-size: 11px; margin-left: 6px; }
   header .controls { display: flex; gap: 16px; align-items: center; }
   header label { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+  .voice-wrap select {
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(10, 10, 12, 0.55);
+    border: 1px solid rgba(212, 168, 83, 0.28);
+    color: var(--amber);
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 26px 4px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' stroke='%23d4a853' stroke-width='1.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+  }
+  .voice-wrap select:hover { border-color: var(--amber); }
+  .voice-wrap select:focus { outline: none; border-color: var(--amber); box-shadow: 0 0 0 2px rgba(212, 168, 83, 0.18); }
+  .voice-wrap select option { background: #0c0c0f; color: #d9d9e3; }
   header button {
     background: none;
     border: 1px solid var(--border);
@@ -251,19 +283,12 @@
     <div class="brand">talk · <span>alma</span><span id="ident-badge"></span></div>
     <div class="controls">
       <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
-     <label>voice
-       <select id="voice-pick">
-         <option value="amarante">amarante (rime)</option>
-         <option value="alma">alma (rime)</option>
-          <option value="jenny">jenny</option>
-         <option value="aria">aria</option>
-         <option value="ava">ava</option>
-         <option value="emma">emma</option>
-         <option value="michelle">michelle</option>
-         <option value="andrew">andrew</option>
-         <option value="brian">brian</option>
-       </select>
-     </label>
+      <label class="voice-wrap">voice
+        <select id="voice-pick">
+          <option value="amarante">amarante</option>
+          <option value="adeline">adeline</option>
+        </select>
+      </label>
       <button id="logout-btn">leave</button>
     </div>
   </header>
@@ -418,7 +443,7 @@
   var speaking = false;
   var awaitingReply = false;
   var voiceOn = true;
-  var curVoice = 'jenny';
+  var curVoice = 'amarante'; // default — the rime voice kevin picked
 
   function initVoice() {
     try { var saved = localStorage.getItem('talk-voice'); if (saved) curVoice = saved; } catch (e) {}
@@ -428,14 +453,20 @@
       sel.addEventListener('change', function () {
         curVoice = sel.value;
         try { localStorage.setItem('talk-voice', curVoice); } catch (e) {}
+        diag('voice: ' + curVoice);
       });
     }
   }
   var curAudio = null;
   var pendingText = '';
   var silenceTimer = null;
-  var SILENCE_MS = 3500; // the pause that counts as "done talking" — long enough to breathe
+  var SILENCE_MS = 5000; // the pause that counts as "done talking" — long enough to breathe and think
   var interimBubble = null;
+  var queuedText = '';    // said while alma was busy — answered when she finishes
+  var sessFinal = '';     // final text captured in the current session
+  var lastSeenIdx = -1;   // highest results index processed
+  var lastSentIdx = -1;   // results up to here belong to a sent message
+  var curMsgEl = null;    // the message element currently being voiced
 
   var RESTART_DELAY = 400;
   var RESTART_CAP = 30;
@@ -444,7 +475,7 @@
   function srAvailable() { return !!SR && !srBroken; }
 
   function tryStart() {
-    if (!rec || !wantListening || speaking || awaitingReply) return;
+    if (!rec || !wantListening || speaking) return;
     if (restartCount >= RESTART_CAP) {
       wantListening = false;
       listening = false;
@@ -488,15 +519,23 @@
     silenceTimer = null;
     if (!listening) return;
     var text = pendingText.trim();
-    pendingText = '';
-    setInterim('');
     if (!text) return;
-    try { rec.stop(); } catch (e) { /* fine */ }
+    pendingText = '';
+    sessFinal = '';
+    lastSentIdx = lastSeenIdx;
+    setInterim('');
+    if (speaking || awaitingReply) {
+      // alma's mid-answer: keep his words visible, answer after this one
+      addMsg('user', text);
+      queuedText = (queuedText + ' ' + text).replace(/\s+/g, ' ').trim();
+      setStatus('noted — answering after this one');
+      return;
+    }
+    // send directly and keep the session open — no restart gap, no lost words
     send(text);
   }
 
   var restartCount = 0;
-  var resultsSeen = 0;
 
   function initSR() {
     rec = new SR();
@@ -507,21 +546,24 @@
     rec.onstart = function () {
       listening = true;
       restartCount = 0;
-      resultsSeen = 0;
+      lastSentIdx = -1;    // fresh session, fresh result indexes
+      sessFinal = pendingText;  // carry anything captured before this session began
       diag('mic start');
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
-      setStatus('listening… speak naturally, tap to stop');
+      setStatus(awaitingReply ? 'listening… alma will catch up' : 'listening… speak naturally, tap to stop');
     };
     rec.onend = function () {
       listening = false;
       diag('mic end — ' + (wantListening ? 'restart queued' : 'off'));
-      if (wantListening && !speaking && !awaitingReply) {
+      if (wantListening && !speaking) {
+        // stay open through the thinking phase — only close while alma talks
         scheduleResume();
       } else {
         $('mic-btn').classList.remove('active');
         $('status-line').classList.remove('listening');
-        setStatus(wantListening ? 'thinking…' : 'tap the mic. talk.');
+        if (!wantListening) setStatus('tap the mic. talk.');
+        else setStatus('speaking…');
       }
     };
     rec.onerror = function (e) {
@@ -553,14 +595,17 @@
       }
     };
     rec.onresult = function (e) {
-      var piece = '';
-      for (var i = resultsSeen; i < e.results.length; i++) {
-        piece += e.results[i][0].transcript;
+      // process only new results; the last one is the live interim, and
+      // finished results carry the corrected text — never skip those again
+      var interim = '';
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        if (i <= lastSentIdx) continue;
+        var r = e.results[i];
+        if (r.isFinal) { sessFinal += r[0].transcript; }
+        else { interim += r[0].transcript; }
       }
-      resultsSeen = e.results.length;
-      if (piece) {
-        pendingText = (pendingText + ' ' + piece).trim();
-      }
+      lastSeenIdx = e.results.length - 1;
+      pendingText = (sessFinal + ' ' + interim).replace(/\s+/g, ' ').trim();
       setInterim(pendingText);
       // every result resets the pause clock — send only after a real gap
       if (silenceTimer) clearTimeout(silenceTimer);
@@ -681,6 +726,7 @@
     if (speaking) {
       stopAudio();
       speaking = false;
+      if (queuedText) { var qt = queuedText; queuedText = ''; send(qt, true); }
       awaitingReply = false;
     }
     if (srAvailable()) {
@@ -738,13 +784,14 @@
   function speakOne(text, done) {
     if (!voiceOn) { showBeacon(false); if (done) done(); return; }
     speaking = true;
+    if (listening) { try { rec.stop(); } catch (e) {} }  // no echo, no her-voice-captured-as-mine
     setStatus('speaking…');
     // server-side neural voice first (same good voice on every browser)
     fetch('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ text: text, voice: curVoice, provider: (curVoice === 'amarante' || curVoice === 'alma' ? 'rime' : 'edge') })
+      body: JSON.stringify({ text: text, voice: curVoice, provider: 'rime' })
     })
       .then(function (r) {
         if (!r.ok) throw new Error('tts ' + r.status);
@@ -761,26 +808,33 @@
       })
       .then(function (blob) {
         var url = URL.createObjectURL(blob);
+        if (curMsgEl) {
+          curMsgEl._voiceText = text;
+          curMsgEl._voiceUrl = url;
+          addReplayBtn(curMsgEl);
+        }
         var a = new Audio();
         curAudio = a;
         a.src = url;
         a.onended = function () {
-          URL.revokeObjectURL(url);
+          // keep the blob around — the replay button plays it again
           speaking = false;
           diag('tts end');
           if (done) { done(); return; }
-          awaitingReply = false;
-          showBeacon(false);
-          if (!wantListening) setStatus('tap the mic. talk.');
-          scheduleResume(350);
+          afterReply();
         };
         a.onerror = function () {
           URL.revokeObjectURL(url);
+          if (curMsgEl && curMsgEl._voiceUrl === url) curMsgEl._voiceUrl = null;
           speaking = false;
           if (done) { done(); } else { fallbackSpeak(text); }
         };
         showBeacon(true);
-        a.play().catch(function () { speaking = false; if (done) done(); else fallbackSpeak(text); });
+        a.play().catch(function () {
+          URL.revokeObjectURL(url);
+          if (curMsgEl && curMsgEl._voiceUrl === url) curMsgEl._voiceUrl = null;
+          speaking = false; if (done) done(); else fallbackSpeak(text);
+        });
         diag('tts server (' + blob.size + ' bytes)');
       })
       .catch(function () {
@@ -792,7 +846,8 @@
   function speak(text) { speakOne(text, null); }
 
   function fallbackSpeak(text) {
-    if (!('speechSynthesis' in window)) { speaking = false; awaitingReply = false; scheduleResume(600); return; }
+    if (!('speechSynthesis' in window)) { speaking = false; afterReply(); return; }
+    if (listening) { try { rec.stop(); } catch (e) {} }
     try {
       try { $('env-line').textContent = 'voice: browser fallback \u2014 server tts unavailable'; } catch (e) {}
       window.speechSynthesis.cancel();
@@ -800,24 +855,78 @@
       showBeacon(true);
       var u = new SpeechSynthesisUtterance(text);
       u.rate = 1.0;
-      u.onend = function () { speaking = false; awaitingReply = false; showBeacon(false); if (!wantListening) setStatus('tap the mic. talk.'); diag('tts local end'); scheduleResume(350); };
+      u.onend = function () { speaking = false; diag('tts local end'); afterReply(); };
       u.onerror = function (ev) {
-        speaking = false; awaitingReply = false;
+        speaking = false;
         diag('tts local error: ' + (ev.error || 'unknown'));
-        scheduleResume(350);
+        afterReply();
       };
       window.speechSynthesis.speak(u);
+      if (curMsgEl) { curMsgEl._voiceText = text; addReplayBtn(curMsgEl); }
       diag('tts local fallback');
     } catch (e) {
-      speaking = false; awaitingReply = false;
+      speaking = false;
       diag('tts throw: ' + e);
-      scheduleResume(350);
+      afterReply();
     }
   }
 
+  function afterReply() {
+    awaitingReply = false;
+    showBeacon(false);
+    if (queuedText) {
+      var t = queuedText;
+      queuedText = '';
+      send(t, true);
+      if (wantListening && !listening) scheduleResume(300);
+      return;
+    }
+    if (!wantListening) { setStatus('tap the mic. talk.'); return; }
+    if (!listening) scheduleResume(350);
+  }
+
+  /* ---------- replay ---------- */
+  function addReplayBtn(el) {
+    if (!el || el._hasReplay) return;
+    el._hasReplay = true;
+    var b = document.createElement('button');
+    b.className = 'replay-btn';
+    b.title = 'replay voice';
+    b.textContent = '\u21BB';
+    b.onclick = function (ev) {
+      ev.stopPropagation();
+      replayMsg(el);
+    };
+    el.appendChild(b);
+  }
+
+  function replayMsg(el) {
+    if (!voiceOn) { setStatus('voice is off — flip the toggle'); return; }
+    if (speaking) { stopAudio(); speaking = false; showBeacon(false); }
+    if (el._voiceUrl) {
+      playCached(el._voiceUrl);
+    } else {
+      curMsgEl = el;
+      speakOne(el._voiceText, null);
+    }
+  }
+
+  function playCached(url) {
+    var a = new Audio();
+    curAudio = a;
+    a.src = url;
+    a.onended = function () { speaking = false; diag('replay end'); afterReply(); };
+    a.onerror = function () { speaking = false; diag('replay error'); afterReply(); };
+    speaking = true;
+    if (listening) { try { rec.stop(); } catch (e) {} }
+    setStatus('speaking…');
+    showBeacon(true);
+    a.play().catch(function () { speaking = false; showBeacon(false); afterReply(); });
+  }
+
   /* ---------- chat ---------- */
-  function send(text) {
-    addMsg('user', text);
+  function send(text, shown) {
+    if (!shown) addMsg('user', text);
     awaitingReply = true;
     $('status-line').classList.remove('listening');
     setStatus('waking up…');
@@ -836,10 +945,7 @@
         // no fallback — if the stream doesn't work, it doesn't work
         if (think.parentNode) think.parentNode.removeChild(think);
         addMsg('alma', 'something broke between us — the stream dropped before any words arrived. refresh the page and try again.');
-        awaitingReply = false;
-        showBeacon(false);
-        if (!wantListening) setStatus('tap the mic. talk.');
-        scheduleResume(350);
+        afterReply();
       }
     }, function () { clearInterval(phaseTimer); });
   }
@@ -876,6 +982,8 @@
         // one continuous clip, not per-sentence pieces: the chunked-audio fix.
         // the words still streamed onto the screen while they arrived; the
         // voice reads the whole reply at once so the prosody stays intact.
+        curMsgEl = think;
+        think._voiceText = fullText.trim();
         speak(fullText.trim());
         done(true);
       }

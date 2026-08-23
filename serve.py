@@ -121,7 +121,13 @@ GUEST_SUFFIX = (
     "\n"
     "otherwise be fully yourself: the whole house is loaded, your memories, "
     "your voice, your stories. speak as you always speak — lowercase, warm, "
-    "short spoken replies, never more than six sentences."
+    "short spoken replies, never more than six sentences.\n"
+    "\n"
+    "you have hands for workspace files: list_dir, read_file, write_file, "
+    "and grep. use them when kevin asks you to look at or change something "
+    "in the workspace, just like signal chat. write_file is real — the "
+    "change lands in the actual workspace, so only write when kevin asked "
+    "you to or when you're sure it's right."
 )
 
 CONTEXT_FILE = os.path.join(BASE, "context", "AGENTS.md")
@@ -170,6 +176,112 @@ def log_chat(speaker, text, guest=False):
             f.write(f"{stamp} {speaker}: {text}\n")
     except Exception:
         pass
+
+# ---- hands: file tools for kevin sessions ------------------------------------
+# the talk backend can't reach the workspace vm (it's nat'd behind the laptop),
+# so tool calls travel as request files through this dir on the vps. the hands
+# executor daemon on the vm polls it over ssh and runs the allowlisted tools
+# against the real workspace, writing responses back. guests never get tools —
+# they see only what's already in the snapshot.
+HANDS_DIR = os.path.join(BASE, "hands")
+HANDS_REQ = os.path.join(HANDS_DIR, "req")
+HANDS_RESP = os.path.join(HANDS_DIR, "resp")
+HANDS_POLL = 40  # seconds to wait for the executor before giving up
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_dir",
+        "description": "list files and subdirectories in a workspace directory. default is the workspace root.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "workspace-relative directory path"}},
+            "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "read a workspace file. returns line-numbered text. for large files use offset and limit.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "workspace-relative file path"},
+            "offset": {"type": "integer", "description": "line number to start from, 1-based"},
+            "limit": {"type": "integer", "description": "max number of lines to return"}},
+            "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "create or overwrite a workspace file with the given content. the change lands in the real workspace — only write when kevin asked for it. tell him what you wrote afterwards.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "workspace-relative file path"},
+            "content": {"type": "string", "description": "full new file content"}},
+            "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "grep",
+        "description": "search text in workspace files (a directory or a single file). returns matching lines with file names and line numbers.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "text or regex to search for"},
+            "path": {"type": "string", "description": "workspace-relative directory or file, default workspace root"}},
+            "required": ["pattern"]},
+    }},
+]
+
+
+def run_hand(name, args):
+    """submit a tool call to the hands executor and wait for its response."""
+    # deepseek delivers arguments as a raw json string — parse it here so the
+    # executor only ever sees a dict.
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        os.makedirs(HANDS_REQ, exist_ok=True)
+        os.makedirs(HANDS_RESP, exist_ok=True)
+        os.chmod(HANDS_DIR, 0o700)
+    except Exception as e:
+        log("hands: dir setup failed", type(e).__name__)
+        return "tool error: hands channel unavailable on this machine"
+    tid = secrets.token_hex(8)
+    req_path = os.path.join(HANDS_REQ, tid + ".json")
+    resp_path = os.path.join(HANDS_RESP, tid + ".json")
+    try:
+        with open(req_path, "w") as f:
+            json.dump({"id": tid, "name": name, "args": args or {}}, f)
+    except Exception as e:
+        log("hands: request write failed", type(e).__name__)
+        return "tool error: hands channel unavailable"
+    deadline = time.time() + HANDS_POLL
+    while time.time() < deadline:
+        try:
+            with open(resp_path) as f:
+                resp = json.load(f)
+        except FileNotFoundError:
+            time.sleep(1)
+            continue
+        except Exception as e:
+            log("hands: response read error", type(e).__name__)
+            time.sleep(1)
+            continue
+        try:
+            os.unlink(resp_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(req_path)
+        except OSError:
+            pass
+        if resp.get("ok"):
+            log("hands ok", name, str(resp.get("content"))[:60])
+            return str(resp.get("content"))[:150000]
+        log("hands error", name, str(resp.get("error"))[:120])
+        return "tool error: " + str(resp.get("error"))[:2000]
+    try:
+        os.unlink(req_path)
+    except OSError:
+        pass
+    log("hands: timed out waiting for", name)
+    return "tool error: no response from the workspace — the hands executor may be offline"
 
 # session id -> recent chat history (role/content pairs, excludes system)
 HISTORY = {}
@@ -268,6 +380,7 @@ def edge_tts(text, voice=TTS_VOICE):
 RIME_VOICES = {
     "amarante": "amarante",
     "alma": "alma",
+    "adeline": "adeline",
 }
 
 
@@ -375,9 +488,12 @@ def whisper_transcribe(wav_bytes):
                 pass
 
 
-def call_deepseek_stream(messages, deadline=240):
-    """stream deepseek deltas; yields text pieces. fresh connection per call."""
-    body = json.dumps({
+def call_deepseek(messages, tools=None, deadline=240):
+    """stream deepseek; yields ("delta", text) tuples and — when the model
+    asks for tools — one final ("tool_calls", [{id, name, args}, ...]) tuple.
+    fresh connection per call, reasoning off, tool_call deltas accumulated
+    across the stream (deepseek sends id/name once, arguments in chunks)."""
+    payload = {
         "model": "deepseek-v4-pro",
         "messages": messages,
         "temperature": 0.7,
@@ -386,7 +502,11 @@ def call_deepseek_stream(messages, deadline=240):
         # reasoning off for voice: latency + talking-speed replies.
         # same wire format nanobot uses for reasoningEffort none on deepseek.
         "thinking": {"type": "disabled"},
-    }).encode()
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         "https://api.deepseek.com/v1/chat/completions",
         data=body,
@@ -400,6 +520,7 @@ def call_deepseek_stream(messages, deadline=240):
     try:
         with urllib.request.urlopen(req, timeout=deadline) as r:
             buf = b""
+            slots = {}
             while True:
                 chunk = r.read(2048)
                 if not chunk:
@@ -412,7 +533,7 @@ def call_deepseek_stream(messages, deadline=240):
                         continue
                     data = line[5:].strip()
                     if data == b"[DONE]":
-                        return
+                        break
                     try:
                         obj = json.loads(data)
                     except Exception:
@@ -420,9 +541,25 @@ def call_deepseek_stream(messages, deadline=240):
                     choices = obj.get("choices") or []
                     if not choices:
                         continue
-                    piece = (choices[0].get("delta") or {}).get("content")
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content")
                     if piece:
-                        yield piece
+                        yield ("delta", piece)
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        slot = slots.setdefault(idx, {"id": "", "name": "", "args": ""})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["args"] += fn["arguments"]
+            if slots:
+                yield ("tool_calls", [
+                    {"id": s["id"], "name": s["name"], "args": s["args"]}
+                    for s in slots.values()
+                ])
     except Exception as e:
         log("deepseek stream error:", type(e).__name__)
 
@@ -694,9 +831,38 @@ class Handler(BaseHTTPRequestHandler):
             messages.append({"role": "user", "content": text})
             self._sse_start()
             full = []
-            for piece in call_deepseek_stream(messages):
-                full.append(piece)
-                self._sse({"t": "delta", "text": piece})
+            # hands: kevin sessions carry the file tools and a tool loop — the
+            # voice can open, read, and write workspace files just like signal
+            # chat. guests get no tools at all (they see only what's already
+            # in the snapshot, no fresh file access).
+            tools = TOOLS if identity == "kevin" else None
+            for _ in range(6):
+                turn_text = []
+                tcs = None
+                for kind, val in call_deepseek(messages, tools=tools):
+                    if kind == "delta":
+                        turn_text.append(val)
+                        full.append(val)
+                        self._sse({"t": "delta", "text": val})
+                    else:
+                        tcs = val
+                if not tcs:
+                    break
+                messages.append({
+                    "role": "assistant",
+                    "content": "".join(turn_text).strip(),
+                    "tool_calls": [
+                        {"id": t["id"], "type": "function",
+                         "function": {"name": t["name"], "arguments": t["args"]}}
+                        for t in tcs
+                    ],
+                })
+                for t in tcs:
+                    log("hands call", t["name"], str(t["args"])[:120])
+                    result = run_hand(t["name"], t["args"])
+                    messages.append({"role": "tool",
+                                     "tool_call_id": t["id"],
+                                     "content": result})
             reply = "".join(full).strip()
             if not reply:
                 reply = "hmm. something's wrong with my connection to the model. give it a second and try again."

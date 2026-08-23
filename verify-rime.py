@@ -72,8 +72,15 @@ def post_json(path, payload):
 try:
     r = post_json("/api/login", {"password": password})
     print("login:", r.status)
+    # the aug 19 two-stage gate: after the site password the session must
+    # identify before chat/tts/transcribe are authorized
+    with open(os.path.join(BASE, "kevin-password")) as f:
+        kpw = f.read().strip()
+    r = post_json("/api/identify", {"kevin": True, "password": kpw})
+    print("identify:", r.status)
     for name, tts_body in [
         ("rime/amarante", {"text": "hola kevin. rime works.", "voice": "amarante", "provider": "rime"}),
+        ("rime/adeline", {"text": "and adeline works too.", "voice": "adeline", "provider": "rime"}),
         ("edge/jenny", {"text": "and jenny still works too.", "voice": "jenny", "provider": "edge"}),
     ]:
         r = post_json("/api/tts", tts_body)
