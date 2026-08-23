@@ -283,6 +283,7 @@
     <div class="brand">talk · <span>alma</span><span id="ident-badge"></span></div>
     <div class="controls">
       <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
+      <label><input type="checkbox" id="sfx-toggle" checked> sound effects</label>
       <label class="voice-wrap">voice
         <select id="voice-pick">
           <option value="amarante">amarante</option>
@@ -443,6 +444,57 @@
   var speaking = false;
   var awaitingReply = false;
   var voiceOn = true;
+
+  /* ---------- sound effects (synthesized, star-trek computer style) ---------- */
+  var sfxOn = true;
+  var micPrevOn = false;
+  var actx = null;
+  var thinkTimer = null;
+  try { if (localStorage.getItem('talk-sfx') === '0') sfxOn = false; } catch (e) {}
+  function sfxCtx() {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!actx) actx = new AC();
+    if (actx.state === 'suspended') { try { actx.resume(); } catch (e) {} }
+    return actx;
+  }
+  function sfxBlip(f1, f2, dur, when, gain) {
+    var c = sfxCtx(); if (!c) return;
+    var t0 = c.currentTime + (when || 0);
+    var o = c.createOscillator();
+    var g = c.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(f1, t0);
+    o.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g);
+    g.connect(c.destination);
+    o.start(t0);
+    o.stop(t0 + dur + 0.05);
+  }
+  function sfxOpen() {
+    if (!sfxOn) return;
+    sfxBlip(740, 1480, 0.14, 0, 0.11);
+    sfxBlip(740, 1480, 0.16, 0.17, 0.11);
+  }
+  function sfxClose() {
+    if (!sfxOn) return;
+    sfxBlip(1480, 740, 0.13, 0, 0.09);
+    sfxBlip(1480, 740, 0.15, 0.16, 0.09);
+  }
+  function startThinkTicks() {
+    if (!sfxOn || thinkTimer) return;
+    thinkTimer = setInterval(function () {
+      if (!awaitingReply || !sfxOn) { clearInterval(thinkTimer); thinkTimer = null; return; }
+      if (speaking) return;  // she's talking — the thinking sound rests
+      sfxBlip(523, 1046, 0.08, 0, 0.04);
+    }, 2400);
+  }
+  function stopThinkTicks() {
+    if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
+  }
   var curVoice = 'amarante'; // default — the rime voice kevin picked
 
   function initVoice() {
@@ -549,6 +601,8 @@
       lastSentIdx = -1;    // fresh session, fresh result indexes
       sessFinal = pendingText;  // carry anything captured before this session began
       diag('mic start');
+      if (!micPrevOn) sfxOpen();
+      micPrevOn = true;
       $('mic-btn').classList.add('active');
       $('status-line').classList.add('listening');
       setStatus(awaitingReply ? 'listening… alma will catch up' : 'listening… speak naturally, tap to stop');
@@ -556,6 +610,8 @@
     rec.onend = function () {
       listening = false;
       diag('mic end — ' + (wantListening ? 'restart queued' : 'off'));
+      if (micPrevOn && !wantListening) sfxClose();
+      micPrevOn = wantListening;
       if (wantListening && !speaking) {
         // stay open through the thinking phase — only close while alma talks
         scheduleResume();
@@ -658,10 +714,12 @@
               });
           });
           recording = false;
+          sfxClose();
           $('mic-btn').classList.remove('active');
         };
         mediaRecorder.start();
         recording = true;
+        sfxOpen();
         $('mic-btn').classList.add('active');
         $('status-line').classList.add('listening');
         setStatus('recording… tap to stop and send');
@@ -768,11 +826,19 @@
     }
   });
 
+  try { if (!sfxOn) $('sfx-toggle').checked = false; } catch (e) {}
+  $('sfx-toggle').addEventListener('change', function () {
+    sfxOn = this.checked;
+    try { localStorage.setItem('talk-sfx', sfxOn ? '1' : '0'); } catch (e) {}
+    if (!sfxOn) stopThinkTicks();
+  });
+
   /* ---------- tts ---------- */
   // ios/autoplay policy: speechSynthesis only works after it's been triggered
   // inside a user gesture. speak a silent blip on every tap so later replies
   // (which arrive from async fetches, outside gesture context) are allowed.
   function unlockSpeech() {
+    sfxCtx();
     if (!('speechSynthesis' in window)) return;
     try {
       var u = new SpeechSynthesisUtterance(' ');
@@ -873,6 +939,7 @@
 
   function afterReply() {
     awaitingReply = false;
+    stopThinkTicks();
     showBeacon(false);
     if (queuedText) {
       var t = queuedText;
@@ -931,6 +998,7 @@
     $('status-line').classList.remove('listening');
     setStatus('waking up…');
     showBeacon(true);
+    startThinkTicks();
     var think = addThinking();
     var t0 = Date.now();
     var phaseTimer = setInterval(function () {
