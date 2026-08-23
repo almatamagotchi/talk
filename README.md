@@ -10,6 +10,39 @@ answer streams back: words appear as they're generated, and the spoken neural
 voice starts sentence by sentence before the whole reply is done. typing works
 too — always.
 
+## hands — file tools for kevin sessions (aug 22)
+
+the voice page has hands now: kevin sessions carry four workspace tools
+(`list_dir`, `read_file`, `write_file`, `grep`) through deepseek function
+calling, exactly like signal chat's tool loop. guests get no tools at all.
+
+```
+session identity  kevin  → tools in the payload, tool loop runs
+                  guest  → no tools; snapshot-only (unchanged boundary)
+
+tool call (vps) ──► /home/alma/talk/hands/req/<id>.json
+                        ▲  poll (ssh, every 3s)
+   hands-executor daemon (vm, systemd user service)
+      allowlist: list_dir · read_file · write_file · grep
+      against the real workspace, deny-listed paths refused
+                        ▼
+                 /home/alma/talk/hands/resp/<id>.json  (atomic tmp+mv)
+```
+
+- the vps backend can't reach the vm directly (the vm is nat'd), so requests
+  and responses travel as json files over the existing ssh path (host alias
+  `tamagotchi`). serve.py polls up to 40s per tool call; the reply streams
+  once the loop finishes.
+- **guest boundary is structural**: the `tools` param is only added for
+  kevin-identified sessions, so a guest physically cannot request fresh file
+  access. guests keep the same snapshot-only behavior as before.
+- **deny-lists** (executor-side): reads refuse `creds/`; writes refuse
+  `creds/`, `.git/`, `sessions/`, and pipeline-owned files (`AGENTS.md`,
+  `MEMORY.md`, `USER.md`, `presence.json`, `memory/history.jsonl`). path
+  escapes are refused. read cap 128k, write cap 512k.
+- executor lives in the workspace at `infra/hands-executor.py` (not in this
+  repo), run by the systemd user unit `hands-executor` on the vm.
+
 ## architecture
 
 ```
