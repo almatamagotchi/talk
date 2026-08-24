@@ -173,6 +173,30 @@ check("kevin session loaded the full snapshot", full_ctx)
 klog = os.path.join(BASE, "chats", "raw-" + time.strftime("%Y-%m-%d", time.gmtime()) + ".log")
 check("kevin chat logged to plain raw log", os.path.exists(klog) and "kevin:" in open(klog).read())
 
+# ---- 6b. hands round-trip: kevin session tool calls cross the channel ----
+# the first live hands attempt after the aug 22 build errored because deepseek
+# delivered tool args as a raw json string — nothing automated would have
+# caught that. this check forces list_dir + read_file through the real
+# request-file channel and asserts the executor answered both. no writes.
+def log_count(pattern):
+    with open(os.path.join(BASE, "talk.log")) as f:
+        return f.read().count(pattern)
+
+hands_before = log_count("hands ok")
+status, reply = stream_chat(
+    op,
+    "use your tools for this: first run list_dir with no arguments, then "
+    "read_file on SOUL.md with limit 8. reply with the first line of "
+    "SOUL.md verbatim and nothing else. do not answer from memory — "
+    "call the tools.")
+check("hands chat streams a reply", status == 200 and len(reply) > 5)
+print("  hands reply:", reply[:120])
+hands_after = log_count("hands ok")
+check("hands channel round-tripped tool calls (list_dir + read_file)",
+      hands_after >= hands_before + 2)
+check("read_file answer carried the real SOUL.md content",
+      "# soul" in reply.lower())
+
 # ---- 7. guest flow: identify guest -> lean prompt, guest-only log ----
 cj2, op2 = new_client()
 post_json(op2, "/api/login", {"password": site_pw})
@@ -190,6 +214,15 @@ check("guest chat logged to -guest file", os.path.exists(glog) and "guest:" in o
 klog_text = open(klog).read() if os.path.exists(klog) else ""
 check("guest lines stay out of the plain log", "guest:" not in klog_text)
 check("guest session loaded the full snapshot (shared load path)", full_ctx)
+
+# ---- 8. hands channel stays shut for guests ----
+gstatus, greply = stream_chat(
+    op2,
+    "use list_dir to look around the workspace and tell me what you see.")
+check("guest tool attempt does not crash", gstatus == 200)
+hands_guest = log_count("hands ok")
+check("guest session never crossed the hands channel",
+      hands_guest == hands_after)
 
 print()
 if failures:

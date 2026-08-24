@@ -288,6 +288,9 @@
         <select id="voice-pick">
           <option value="amarante">amarante</option>
           <option value="adeline">adeline</option>
+          <option value="mopang">mopang</option>
+          <option value="luciana">luciana</option>
+          <option value="luz">luz</option>
         </select>
       </label>
       <button id="logout-btn">leave</button>
@@ -512,7 +515,7 @@
   var curAudio = null;
   var pendingText = '';
   var silenceTimer = null;
-  var SILENCE_MS = 5000; // the pause that counts as "done talking" — long enough to breathe and think
+  var SILENCE_MS = 4000; // the pause that counts as "done talking" — long enough to breathe, short enough to keep the flow
   var interimBubble = null;
   var queuedText = '';    // said while alma was busy — answered when she finishes
   var sessFinal = '';     // final text captured in the current session
@@ -522,6 +525,20 @@
 
   var RESTART_DELAY = 400;
   var RESTART_CAP = 30;
+
+  var lastWarm = 0;
+  // cache warm-up: push the full snapshot through deepseek the moment the
+  // mic opens, so the prefill happens while kevin is still talking and the
+  // real turn after the pause is a cache hit (~4s instead of ~55s).
+  // best-effort and throttled — at most one prefill every 30 seconds.
+  function warm() {
+    var now = Date.now();
+    if (now - lastWarm < 30000) return;
+    lastWarm = now;
+    fetch('/api/warm', { method: 'POST', credentials: 'same-origin' })
+      .then(function () { diag('warmed'); })
+      .catch(function () { /* best-effort — next turn just pays the prefill */ });
+  }
 
   /* ---------- speech recognition (chrome — streams interim live) ---------- */
   function srAvailable() { return !!SR && !srBroken; }
@@ -601,6 +618,7 @@
       lastSentIdx = -1;    // fresh session, fresh result indexes
       sessFinal = pendingText;  // carry anything captured before this session began
       diag('mic start');
+      warm();   // prefill the context cache while he talks
       if (!micPrevOn) sfxOpen();
       micPrevOn = true;
       $('mic-btn').classList.add('active');
@@ -720,6 +738,7 @@
         mediaRecorder.start();
         recording = true;
         sfxOpen();
+        warm();   // recorder path: warm the cache while the audio accumulates
         $('mic-btn').classList.add('active');
         $('status-line').classList.add('listening');
         setStatus('recording… tap to stop and send');

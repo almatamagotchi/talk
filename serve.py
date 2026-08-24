@@ -381,6 +381,9 @@ RIME_VOICES = {
     "amarante": "amarante",
     "alma": "alma",
     "adeline": "adeline",
+    "mopang": "mopang",
+    "luciana": "luciana",
+    "luz": "luz",
 }
 
 
@@ -488,16 +491,17 @@ def whisper_transcribe(wav_bytes):
                 pass
 
 
-def call_deepseek(messages, tools=None, deadline=240):
+def call_deepseek(messages, tools=None, deadline=240, max_tokens=600):
     """stream deepseek; yields ("delta", text) tuples and — when the model
     asks for tools — one final ("tool_calls", [{id, name, args}, ...]) tuple.
     fresh connection per call, reasoning off, tool_call deltas accumulated
-    across the stream (deepseek sends id/name once, arguments in chunks)."""
+    across the stream (deepseek sends id/name once, arguments in chunks).
+    max_tokens is a knob so cache-warming can ask for almost nothing."""
     payload = {
         "model": "deepseek-v4-pro",
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 600,
+        "max_tokens": max_tokens,
         "stream": True,
         # reasoning off for voice: latency + talking-speed replies.
         # same wire format nanobot uses for reasoningEffort none on deepseek.
@@ -800,6 +804,34 @@ class Handler(BaseHTTPRequestHandler):
                 return
             log("heard:", text[:80])
             self._send(200, {"ok": True, "text": text})
+        elif path == "/api/warm":
+            # cache warm-up: run the full snapshot through deepseek NOW (while
+            # kevin is still speaking) so the next real turn is a cache hit.
+            # same system prefix as /api/chat/stream, same session history,
+            # tiny max_tokens, output discarded, nothing logged to history —
+            # the conversation must not know it happened. best-effort: any
+            # error just means the next turn pays the prefill as before.
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False})
+                return
+            identity = identity_of(sid)
+            if identity == "site":
+                self._send(403, {"ok": False})
+                return
+            ctx = load_context()
+            if ctx is None:
+                self._send(200, {"ok": True, "warm": False})
+                return
+            ctx += GUEST_SUFFIX if identity == "guest" else VOICE_SUFFIX
+            hist = HISTORY.get(sid, [])
+            messages = [{"role": "system", "content": ctx}]
+            messages += hist[-HISTORY_MAX:]
+            messages.append({"role": "user", "content": "warm"})
+            for _kind, _val in call_deepseek(messages, max_tokens=8):
+                pass
+            log("warm ok", identity)
+            self._send(200, {"ok": True, "warm": True})
         elif path == "/api/chat/stream":
             sid = self._authed_session()
             if not sid:
