@@ -70,6 +70,7 @@ lighttpd  talk.almatamagotchi.com
 | POST | `/api/identify` | `{"kevin": true, "password": "..."}` → kevin session (full alma) · `{"kevin": false}` → guest session |
 | GET | `/api/session` | `{"ok": true, "identity": "site"\|kevin\|guest"}` if authed, else 401 |
 | POST | `/api/logout` | clears the cookie |
+| POST | `/api/warm` | cache-warmer, fired by the frontend the moment the mic opens: pushes the full snapshot through deepseek (`max_tokens` tiny, output discarded, nothing logged) so the prefill happens *while kevin is still talking* — the real turn after the pause is then a context-cache hit. client-side throttle: one warm per 30s |
 | POST | `/api/chat/stream` | `{"text": "..."}` → SSE `data: {"t":"delta"|"done", "text"}` — the only chat path (no fallback) |
 | POST | `/api/tts` | `{"text": "...", "voice": "jenny", "provider": "edge"}` → mp3 bytes. default azure `en-US-JennyNeural` via edge-tts (free, no key); `provider: "rime"` switches to the rime coda neural voices. `voice` is validated against allowlists — arbitrary input never reaches a tts provider |
 | POST | `/api/transcribe` | raw 16k mono wav body → `{"text": "..."}` via whisper.cpp (`base.en`) |
@@ -136,17 +137,26 @@ heard whisper-style.
 
 ## voices
 
-the frontend has a picker (persisted as `talk-voice`) — seven edge-tts
-voices plus two rime voices, all validated server-side against allowlists
-and silently falling back to jenny on anything unknown:
+the frontend has a picker (persisted as `talk-voice`) — **five rime voices,
+amarante the default** (kevin's pick after the aug 22 voice-default saga:
+"no no not jenny, the other one! starts with an a..."), all validated
+server-side against `RIME_VOICES` and routed through the rime provider:
 
-- **edge-tts** (azure neural, free, no key): jenny (default), aria, ava,
-  emma, michelle, andrew, brian
-- **rime** (coda model, `creds/rime.key` on the vm / `rime.key` on the VPS,
-  never committed): amarante, and **alma** — the coda catalog has a voice
-  literally named alma. A/B sample clips live at
+- **the shelf**: amarante (default) · adeline · mopang · luciana · luz — all
+  rime coda model, `creds/rime.key` on the vm / `rime.key` on the VPS, never
+  committed. each new voice is checked against the rime api before wiring in
+  (real, distinct — luciana and luz return identical byte sizes on the same
+  line but hash differently, so they're genuinely two voices, not a silent
+  fallback).
+- **edge-tts is the fallback, not the shelf.** the edge allowlist (jenny,
+  aria, ava, emma, michelle, andrew, brian) still lives in serve.py, but the
+  page no longer offers it — jenny speaks only when rime fails or a bogus
+  voice is requested. the diag line reports what actually spoke
+  (`voice: <name>`, plus a fell-back note when substitution happened).
+- **the coda catalog has a voice literally named alma.** samples live at
   `talk.almatamagotchi.com/samples/` (same three lines per voice, so they
-  compare fairly)
+  compare fairly) — the picker entry for it is one line away if kevin ever
+  wants it.
 
 ## backend config (on the VPS, chmod 600, never committed)
 
@@ -199,6 +209,20 @@ logs at `/home/alma/talk/talk.log`.
   deepseek api for every call — no keep-alive reuse. that's deliberate: the
   great connection wedge of aug 14 (stale pooled connections killed every
   turn for ten hours) is the lesson.
+- **the warm endpoint and the numbers behind it.** `/api/warm` pre-fills the
+  context cache when the mic opens: measured on the box, warm = 62s
+  (cache-miss full prefill) while the user is still talking, and the real
+  chat after a warm is first-delta ~3.9s / total ~4.2s. the perceived flow:
+  talk → 4s pause → answer ~4s later. the slow part still exists, it just
+  happens invisibly while the sentence is still being formed.
+- **frontend deploys go to the docroot first — or you serve stale pages.**
+  lighttpd serves `/usr/local/www/alma/talk/index.html`; the backend's own
+  copy at `/home/alma/talk/index.html` is a working copy, NOT what the
+  browser gets. the aug 23 lesson: deploying only to `/home/alma/talk/` made
+  the page keep serving yesterday's build while the api tests all passed.
+  deploy rule: copy to the docroot, md5-verify the live page, then sync the
+  repo. (same for `samples/` — that dir is root:www, so deploys there need
+  `sudo cp`.)
 
 ## privacy
 
