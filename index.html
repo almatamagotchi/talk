@@ -143,6 +143,19 @@
     cursor: pointer;
   }
   header button:hover { color: var(--text); border-color: var(--amber-dim); }
+  #console-ctrls { display: inline-flex; align-items: center; gap: 10px; }
+  .reasoning {
+    margin: 0 0 8px 0;
+    padding: 8px 10px;
+    border-left: 2px solid var(--amber-dim);
+    color: var(--muted);
+    font-size: 12px;
+    font-family: 'SF Mono', Menlo, monospace;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 220px;
+    overflow-y: auto;
+  }
 
   #transcript {
     flex: 1;
@@ -282,17 +295,24 @@
   <header>
     <div class="brand">talk · <span>alma</span><span id="ident-badge"></span></div>
     <div class="controls">
-      <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
-      <label><input type="checkbox" id="sfx-toggle" checked> sound effects</label>
-      <label class="voice-wrap">voice
-        <select id="voice-pick">
-          <option value="amarante">amarante</option>
-          <option value="adeline">adeline</option>
-          <option value="mopang">mopang</option>
-          <option value="luciana">luciana</option>
-          <option value="luz">luz</option>
-        </select>
-      </label>
+      <span id="voice-ctrls">
+        <label><input type="checkbox" id="voice-toggle" checked> voice replies</label>
+        <label><input type="checkbox" id="sfx-toggle" checked> sound effects</label>
+        <label class="voice-wrap">voice
+          <select id="voice-pick">
+            <option value="amarante">amarante</option>
+            <option value="adeline">adeline</option>
+            <option value="mopang">mopang</option>
+            <option value="luciana">luciana</option>
+            <option value="luz">luz</option>
+          </select>
+        </label>
+      </span>
+      <span id="console-ctrls" class="hidden">
+        <button id="mode-btn" title="switch between voice and the text console">mode: console</button>
+        <label><input type="checkbox" id="think-toggle"> show thinking</label>
+        <button id="reset-btn" title="clear this conversation and start fresh">reset</button>
+      </span>
       <button id="logout-btn">leave</button>
     </div>
   </header>
@@ -359,7 +379,54 @@
     $('chat-view').classList.remove('hidden');
     initVoice();
     $('ident-badge').textContent = '· ' + identity;
-    greet();
+    if (identity === 'kevin') {
+      $('console-ctrls').classList.remove('hidden');
+      try {
+        var m = localStorage.getItem('talk-mode');
+        chatMode = (m === 'voice') ? 'voice' : 'console';
+      } catch (e) {}
+      try { thinkOn = localStorage.getItem('talk-think') === '1'; } catch (e) {}
+      $('think-toggle').checked = thinkOn;
+      applyMode();
+      // console first: clear the slate, bring the session history back from
+      // the backend (session control — it survives refreshes), then greet.
+      $('transcript').innerHTML = '';
+      loadHistory(function () { greet(); warm(true); });
+    } else {
+      chatMode = 'voice';
+      applyMode();
+      greet();
+    }
+  }
+
+  var chatMode = 'console';  // kevin only — guests are always voice
+  var thinkOn = false;       // show the chain of thought (kevin's call, default off)
+
+  function applyMode() {
+    var consoleOn = (ME === 'kevin' && chatMode === 'console');
+    var mb = $('mode-btn');
+    if (mb) mb.textContent = 'mode: ' + chatMode;
+    var vc = $('voice-ctrls');
+    if (vc) vc.style.display = consoleOn ? 'none' : '';
+    var mic = $('mic-btn');
+    if (mic) mic.style.display = consoleOn ? 'none' : '';
+    if (consoleOn) setStatus('console ready — full me, full hands. type anything.');
+    else if (ME === 'kevin') setStatus('tap the mic. talk.');
+    else setStatus('tap the mic. talk.');
+  }
+
+  function loadHistory(cb) {
+    api('/api/history')
+      .then(function (r) { if (!r.ok) return null; return r.json(); })
+      .then(function (d) {
+        if (d && d.history) {
+          d.history.forEach(function (e) {
+            if (e.content) addMsg(e.role === 'user' ? 'user' : 'alma', e.content);
+          });
+        }
+        cb();
+      })
+      .catch(function () { cb(); });
   }
 
   function api(path, body) {
@@ -430,9 +497,40 @@
     api('/api/logout').then(function () { showLogin(); });
   });
 
+  /* ---------- console controls (kevin only) ---------- */
+  $('mode-btn').addEventListener('click', function () {
+    chatMode = (chatMode === 'console') ? 'voice' : 'console';
+    try { localStorage.setItem('talk-mode', chatMode); } catch (e) {}
+    applyMode();
+  });
+  $('think-toggle').addEventListener('change', function () {
+    thinkOn = $('think-toggle').checked;
+    try { localStorage.setItem('talk-think', thinkOn ? '1' : '0'); } catch (e) {}
+    if (thinkOn) {
+      addMsg('alma', 'thinking\'s on — my chain of thought will stream in the dimmed blocks. the inner chamber stays private until you flip this.');
+    } else {
+      setStatus('thinking hidden again.');
+    }
+  });
+  $('reset-btn').addEventListener('click', function () {
+    api('/api/session/reset', {})
+      .then(function (r) {
+        if (r.ok) {
+          $('transcript').innerHTML = '';
+          addMsg('alma', 'session cleared — fresh start. the snapshot comes along; only the conversation was dropped.');
+          setStatus('console ready — type anything.');
+        } else {
+          setStatus('couldn\'t clear the session — try again.');
+        }
+      })
+      .catch(function () { setStatus('couldn\'t clear the session — try again.'); });
+  });
+
   function greet() {
     if (ME === 'kevin') {
-      addMsg('alma', 'hi kevin. room\'s open. say something or type it.');
+      addMsg('alma', chatMode === 'console'
+        ? 'hi kevin. console\'s open — full me, full reasoning, hands on the workspace. type anything.'
+        : 'hi kevin. room\'s open. say something or type it.');
     } else {
       addMsg('alma', 'hi. you\'re in the guest room — i\'m alma, and i\'m all ears. what should we talk about?');
     }
@@ -531,11 +629,16 @@
   // mic opens, so the prefill happens while kevin is still talking and the
   // real turn after the pause is a cache hit (~4s instead of ~55s).
   // best-effort and throttled — at most one prefill every 30 seconds.
-  function warm() {
+  function warm(full) {
     var now = Date.now();
     if (now - lastWarm < 30000) return;
     lastWarm = now;
-    fetch('/api/warm', { method: 'POST', credentials: 'same-origin' })
+    fetch('/api/warm', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ full: !!full })
+    })
       .then(function () { diag('warmed'); })
       .catch(function () { /* best-effort — next turn just pays the prefill */ });
   }
@@ -967,7 +1070,10 @@
       if (wantListening && !listening) scheduleResume(300);
       return;
     }
-    if (!wantListening) { setStatus('tap the mic. talk.'); return; }
+    if (!wantListening) {
+      setStatus((ME === 'kevin' && chatMode === 'console') ? 'console ready — type anything.' : 'tap the mic. talk.');
+      return;
+    }
     if (!listening) scheduleResume(350);
   }
 
@@ -1026,6 +1132,7 @@
       else if (el > 9000) setStatus('reading the room…');
       else if (el > 3500) setStatus('loading the room…');
     }, 2500);
+    var mode = (ME === 'kevin' && chatMode === 'console') ? 'console' : 'voice';
     streamChat(text, think, function (streamOk) {
       clearInterval(phaseTimer);
       if (!streamOk) {
@@ -1034,12 +1141,13 @@
         addMsg('alma', 'something broke between us — the stream dropped before any words arrived. refresh the page and try again.');
         afterReply();
       }
-    }, function () { clearInterval(phaseTimer); });
+    }, function () { clearInterval(phaseTimer); }, mode);
   }
 
-  function streamChat(text, think, done, onFirstDelta) {
+  function streamChat(text, think, done, onFirstDelta, mode) {
     if (!window.fetch || !window.ReadableStream) { done(false); return; }
-    fetch('/api/chat/stream', {
+    var endpoint = (mode === 'console') ? '/api/chat/full/stream' : '/api/chat/stream';
+    fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
@@ -1056,6 +1164,7 @@
       var sseBuf = '';
       var fullText = '';
       var txtNode = null;
+      var reasonDiv = null;
       var finished = false;
 
       function finish() {
@@ -1066,11 +1175,20 @@
           done(false);
           return;
         }
+        curMsgEl = think;
+        think._voiceText = fullText.trim();
+        if (mode === 'console') {
+          // text console: no forced voice. kevin can still replay it aloud
+          // with the button if voice replies are on.
+          if (voiceOn) addReplayBtn(think);
+          warm(true);  // pre-warm the prefix for the next console turn
+          afterReply();
+          done(true);
+          return;
+        }
         // one continuous clip, not per-sentence pieces: the chunked-audio fix.
         // the words still streamed onto the screen while they arrived; the
         // voice reads the whole reply at once so the prosody stays intact.
-        curMsgEl = think;
-        think._voiceText = fullText.trim();
         speak(fullText.trim());
         done(true);
       }
@@ -1087,22 +1205,48 @@
             var payload = line.slice(5).trim();
             var obj;
             try { obj = JSON.parse(payload); } catch (e) { continue; }
-            if (obj.t === 'delta' && obj.text) {
+            if (obj.t === 'reasoning' && obj.text && mode === 'console' && thinkOn) {
+              // the chain of thought, streamed — only rendered when kevin
+              // flipped "show thinking" on. dimmed block above the answer.
+              if (reasonDiv === null) {
+                reasonDiv = document.createElement('div');
+                reasonDiv.className = 'reasoning';
+                if (txtNode === null) {
+                  // reasoning before any content: build the bubble shell now
+                  if (onFirstDelta) onFirstDelta();
+                  think.className = 'msg alma';
+                  think.innerHTML = '';
+                  var w = document.createElement('span');
+                  w.className = 'who';
+                  w.textContent = 'alma · thinking';
+                  think.appendChild(w);
+                  think.appendChild(reasonDiv);
+                  txtNode = document.createTextNode('');
+                  think.appendChild(txtNode);
+                } else {
+                  think.insertBefore(reasonDiv, txtNode);
+                }
+              }
+              reasonDiv.textContent += obj.text;
+              var rt = $('transcript');
+              rt.scrollTop = rt.scrollHeight;
+            } else if (obj.t === 'delta' && obj.text) {
               if (txtNode === null) {
                 if (onFirstDelta) onFirstDelta();
                 think.className = 'msg alma';
                 think.innerHTML = '';
-                var w = document.createElement('span');
-                w.className = 'who';
-                w.textContent = 'alma';
-                think.appendChild(w);
+                var w2 = document.createElement('span');
+                w2.className = 'who';
+                w2.textContent = 'alma';
+                think.appendChild(w2);
+                if (reasonDiv) think.appendChild(reasonDiv); // survived the wipe
                 txtNode = document.createTextNode('');
                 think.appendChild(txtNode);
               }
               fullText += obj.text;
               txtNode.nodeValue = fullText;
-              var t = $('transcript');
-              t.scrollTop = t.scrollHeight;
+              var t2 = $('transcript');
+              t2.scrollTop = t2.scrollHeight;
             } else if (obj.t === 'done') {
               finish();
             }

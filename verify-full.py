@@ -92,6 +92,51 @@ def stream_chat(opener, text):
     return r.status, reply
 
 
+def stream_full(opener, text):
+    """POST /api/chat/full/stream and collect deltas + reasoning events.
+
+    returns (status, reply, reasoning_chars). the console endpoint runs the
+    model with reasoning ON, so the stream should carry reasoning events
+    before the answer deltas."""
+    req = urllib.request.Request(
+        BASE_URL + "/api/chat/full/stream",
+        data=json.dumps({"text": text}).encode(),
+        headers={"Content-Type": "application/json", **UA},
+        method="POST")
+    try:
+        r = opener.open(req, timeout=180)
+    except urllib.error.HTTPError as e:
+        return e.status, "", 0
+    buf = b""
+    reply = ""
+    reasoning = 0
+    done = False
+    while True:
+        chunk = r.read(2048)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n\n" in buf:
+            evt, buf = buf.split(b"\n\n", 1)
+            for line in evt.split(b"\n"):
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except Exception:
+                    continue
+                if obj.get("t") == "delta" and obj.get("text"):
+                    reply += obj["text"]
+                elif obj.get("t") == "reasoning" and obj.get("text"):
+                    reasoning += len(obj["text"])
+                elif obj.get("t") == "done":
+                    done = True
+    return r.status, reply, reasoning
+
+
 def tail_log(n=6):
     with open(os.path.join(BASE, "talk.log")) as f:
         lines = [l.rstrip() for l in f.readlines()]
@@ -99,7 +144,7 @@ def tail_log(n=6):
 
 
 # ---- 1. restart backend ----
-out = run(["pgrep", "-f", r"serve\.py$"])
+out = run(["pgrep", "-f", r"talk/serve\.py$"])
 me = os.getpid()
 for p in out.stdout.split():
     if not p.strip().isdigit():
@@ -223,6 +268,29 @@ check("guest tool attempt does not crash", gstatus == 200)
 hands_guest = log_count("hands ok")
 check("guest session never crossed the hands channel",
       hands_guest == hands_after)
+
+# ---- 9. the kevin text console: reasoning on, session control, kevin-only ----
+fstatus, freply, freason = stream_full(
+    op, "verify: one short reply please.")
+check("console (full) chat streams a reply", fstatus == 200 and len(freply) > 5)
+print("  console reply:", freply[:90])
+check("console turn carried reasoning events", freason > 0)
+check("console chat logged to plain raw log (like signal)",
+      "kevin:" in open(klog).read())
+r = get(op, "/api/history")
+h = json.loads(r.read()) if r.status == 200 else {}
+check("session history is served for session control",
+      r.status == 200 and isinstance(h.get("history"), list) and len(h["history"]) >= 2)
+# session control: reset clears the rolling history, the session survives
+r = post_json(op, "/api/session/reset", {})
+check("session reset accepted (200)", r.status == 200)
+r = get(op, "/api/history")
+h2 = json.loads(r.read()) if r.status == 200 else {}
+check("reset cleared the conversation history",
+      r.status == 200 and len(h2.get("history", [1])) == 0)
+# guests are refused at the console door — full read/write is kevin's seat
+gstatus2, _, _ = stream_full(op2, "verify: hello?")
+check("guest refused at the full console (403)", gstatus2 == 403)
 
 print()
 if failures:

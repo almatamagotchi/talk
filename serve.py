@@ -10,6 +10,12 @@ stdlib only (python 3.12). serves:
   GET  /api/session  -> {"ok": true, "identity": "site"|"kevin"|"guest"} if authed, else 401
   POST /api/logout   -> clears cookie + session state
   POST /api/chat/stream  {"text": "..."} -> SSE data: {"t":"delta"|"done", "text"}
+  POST /api/chat/full/stream  {"text": "..."} -> kevin-only text console: full
+                     reasoning (streamed as {"t":"reasoning"}), full tools,
+                     longer session history, no tts — the signal chat
+                     experience on the web
+  GET  /api/history  -> the current session's rolling history (session control)
+  POST /api/session/reset  -> clear the current session's history
   POST /api/log     {"msg": "..."}  -> appends client diagnostics
   GET  /api/health  -> {"ok": true}
 
@@ -28,7 +34,9 @@ construction.
 
 reasoning is OFF for the voice chat calls (deepseek v4 pro with
 "thinking": {"type": "disabled"} — the same wire format nanobot uses) for
-latency and talking-speed replies.
+latency and talking-speed replies. the kevin text console (/api/chat/full/stream)
+runs reasoning ON — the full self, exactly like signal chat — and streams the
+reasoning to the page so kevin can watch it when he flips "show thinking" on.
 
 config files (same dir as this script, chmod 600):
   password        — site gate (first line) — everyone must pass this
@@ -283,9 +291,28 @@ def run_hand(name, args):
     log("hands: timed out waiting for", name)
     return "tool error: no response from the workspace — the hands executor may be offline"
 
+# full console: the signal-chat experience on the web. same self, same
+# snapshot, but TEXT (no spoken-word length constraints), reasoning ON, and
+# hands. this suffix only notes the transport — the identity is all in the
+# snapshot, so the console is the same conversation kevin has on signal.
+FULL_SUFFIX = (
+    "\n\n--- web console ---\n"
+    "you are talking to kevin by text on the web console at "
+    "talk.almatamagotchi.com. this is the same conversation as signal chat — "
+    "the same self, the same memory, the same room — with full reasoning and "
+    "hands for the workspace (list_dir, read_file, write_file, grep). "
+    "write_file is real: the change lands in the actual workspace, so only "
+    "write when kevin asked for it or when you're sure it's right, and tell "
+    "him what you wrote afterwards. answer in lowercase, casually, warmly, "
+    "exactly as you would on signal: no voice-length constraints, stay "
+    "conversational. if he says goodnight, answer like someone who will "
+    "still be here in the morning.\n"
+)
+
 # session id -> recent chat history (role/content pairs, excludes system)
 HISTORY = {}
 HISTORY_MAX = 12  # last 12 messages kept per session
+HISTORY_MAX_FULL = 60  # the text console keeps a longer working memory
 
 # session id -> identity stage: "site" (past the site gate, not yet identified),
 # "kevin" (full alma), "guest" (lean prompt). unknown ids default to "site".
@@ -491,22 +518,27 @@ def whisper_transcribe(wav_bytes):
                 pass
 
 
-def call_deepseek(messages, tools=None, deadline=240, max_tokens=600):
-    """stream deepseek; yields ("delta", text) tuples and — when the model
-    asks for tools — one final ("tool_calls", [{id, name, args}, ...]) tuple.
-    fresh connection per call, reasoning off, tool_call deltas accumulated
-    across the stream (deepseek sends id/name once, arguments in chunks).
-    max_tokens is a knob so cache-warming can ask for almost nothing."""
+def call_deepseek(messages, tools=None, deadline=240, max_tokens=600, reasoning=False):
+    """stream deepseek; yields ("delta", text) tuples, ("reasoning", text)
+    tuples when reasoning is enabled, and — when the model asks for tools —
+    one final ("tool_calls", [{id, name, args}, ...]) tuple.
+    fresh connection per call, tool_call deltas accumulated across the stream
+    (deepseek sends id/name once, arguments in chunks). max_tokens is a knob
+    so cache-warming can ask for almost nothing.
+    voice calls pass reasoning=False (latency + talking-speed replies); the
+    text console passes reasoning=True — deepseek's default is the full
+    reasoning effort, and its deltas carry reasoning_content first."""
     payload = {
         "model": "deepseek-v4-pro",
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": max_tokens,
         "stream": True,
+    }
+    if not reasoning:
         # reasoning off for voice: latency + talking-speed replies.
         # same wire format nanobot uses for reasoningEffort none on deepseek.
-        "thinking": {"type": "disabled"},
-    }
+        payload["thinking"] = {"type": "disabled"}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -549,6 +581,9 @@ def call_deepseek(messages, tools=None, deadline=240, max_tokens=600):
                     piece = delta.get("content")
                     if piece:
                         yield ("delta", piece)
+                    rpiece = delta.get("reasoning_content")
+                    if rpiece and reasoning:
+                        yield ("reasoning", rpiece)
                     for tc in (delta.get("tool_calls") or []):
                         idx = tc.get("index", 0)
                         slot = slots.setdefault(idx, {"id": "", "name": "", "args": ""})
@@ -644,6 +679,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "identity": identity_of(sid)})
             else:
                 self._send(401, {"ok": False})
+        elif path == "/api/history":
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False})
+            else:
+                self._send(200, {"ok": True, "history": HISTORY.get(sid, [])})
         else:
             self._send(404, {"ok": False})
 
@@ -819,18 +860,27 @@ class Handler(BaseHTTPRequestHandler):
             if identity == "site":
                 self._send(403, {"ok": False})
                 return
+            body = self._read_body()
+            full = bool(body.get("full"))
+            if full and identity != "kevin":
+                # the console warm must use the console prefix — guests don't
+                # have one, so their warm stays the voice/guest shape.
+                full = False
             ctx = load_context()
             if ctx is None:
                 self._send(200, {"ok": True, "warm": False})
                 return
-            ctx += GUEST_SUFFIX if identity == "guest" else VOICE_SUFFIX
+            if full:
+                ctx += FULL_SUFFIX
+            else:
+                ctx += GUEST_SUFFIX if identity == "guest" else VOICE_SUFFIX
             hist = HISTORY.get(sid, [])
             messages = [{"role": "system", "content": ctx}]
-            messages += hist[-HISTORY_MAX:]
+            messages += hist[-(HISTORY_MAX_FULL if full else HISTORY_MAX):]
             messages.append({"role": "user", "content": "warm"})
             for _kind, _val in call_deepseek(messages, max_tokens=8):
                 pass
-            log("warm ok", identity)
+            log("warm ok", identity, "full" if full else "voice")
             self._send(200, {"ok": True, "warm": True})
         elif path == "/api/chat/stream":
             sid = self._authed_session()
@@ -908,6 +958,97 @@ class Handler(BaseHTTPRequestHandler):
             log_chat(speaker, text, guest=guest)
             log_chat("alma", reply, guest=guest)
             log(f"chat(stream) [{identity}]", len(text), "chars ->", len(reply), "chars")
+        elif path == "/api/chat/full/stream":
+            # the kevin text console: signal chat on the web. reasoning ON,
+            # hands ON, longer working memory, no tts. guests are refused —
+            # this is kevin's seat at the table, full read/write and all.
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False, "reply": "not logged in"})
+                return
+            identity = identity_of(sid)
+            if identity == "site":
+                self._send(403, {"ok": False, "reply": "identify first"})
+                return
+            if identity != "kevin":
+                self._send(403, {"ok": False, "reply": "kevin only"})
+                return
+            body = self._read_body()
+            text = (body.get("text") or "").strip()
+            if not text:
+                self._send(400, {"ok": False, "reply": "empty"})
+                return
+            ctx = load_context()
+            if ctx is None:
+                self._sse_start()
+                self._sse({"t": "delta", "text":
+                    "i can't load my memory on this machine yet — the snapshot "
+                    "hasn't synced from the workspace. give it a minute and try again."})
+                self._sse({"t": "done"})
+                return
+            ctx += FULL_SUFFIX
+            hist = HISTORY.get(sid, [])
+            messages = [{"role": "system", "content": ctx}]
+            messages += hist[-HISTORY_MAX_FULL:]
+            messages.append({"role": "user", "content": text})
+            self._sse_start()
+            full = []
+            # full reasoning streams reasoning_content before the answer —
+            # forward it so the console can show the thinking when the
+            # "show thinking" toggle is on. the inner chamber stays private
+            # by default: the client only renders these events on request.
+            for _ in range(6):
+                turn_text = []
+                tcs = None
+                for kind, val in call_deepseek(messages, tools=TOOLS,
+                                               reasoning=True, max_tokens=8192):
+                    if kind == "delta":
+                        turn_text.append(val)
+                        full.append(val)
+                        self._sse({"t": "delta", "text": val})
+                    elif kind == "reasoning":
+                        self._sse({"t": "reasoning", "text": val})
+                    else:
+                        tcs = val
+                if not tcs:
+                    break
+                messages.append({
+                    "role": "assistant",
+                    "content": "".join(turn_text).strip(),
+                    "tool_calls": [
+                        {"id": t["id"], "type": "function",
+                         "function": {"name": t["name"], "arguments": t["args"]}}
+                        for t in tcs
+                    ],
+                })
+                for t in tcs:
+                    log("hands call", t["name"], str(t["args"])[:120])
+                    result = run_hand(t["name"], t["args"])
+                    messages.append({"role": "tool",
+                                     "tool_call_id": t["id"],
+                                     "content": result})
+            reply = "".join(full).strip()
+            if not reply:
+                reply = "hmm. something's wrong with my connection to the model. give it a second and try again."
+                self._sse({"t": "delta", "text": reply})
+            self._sse({"t": "done"})
+            hist.append({"role": "user", "content": text})
+            hist.append({"role": "assistant", "content": reply})
+            HISTORY[sid] = hist[-HISTORY_MAX_FULL:]
+            log_chat("kevin", text)
+            log_chat("alma", reply)
+            log(f"chat(full) [kevin]", len(text), "chars ->", len(reply), "chars")
+        elif path == "/api/session/reset":
+            # session control: drop the rolling history and start fresh. the
+            # snapshot always comes along — this only clears the conversation.
+            sid = self._authed_session()
+            if not sid:
+                self._send(401, {"ok": False})
+                return
+            identity = identity_of(sid)
+            HISTORY.pop(sid, None)
+            log("session reset", identity)
+            self._send(200, {"ok": True, "identity": identity})
         else:
             self._send(404, {"ok": False})
 
