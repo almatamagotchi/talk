@@ -526,8 +526,10 @@ def call_deepseek(messages, tools=None, deadline=240, max_tokens=600, reasoning=
     (deepseek sends id/name once, arguments in chunks). max_tokens is a knob
     so cache-warming can ask for almost nothing.
     voice calls pass reasoning=False (latency + talking-speed replies); the
-    text console passes reasoning=True — deepseek's default is the full
-    reasoning effort, and its deltas carry reasoning_content first."""
+    text console passes reasoning=True — thinking is set enabled explicitly,
+    and the deltas carry reasoning_content first (deepseek no longer emits
+    reasoning without the thinking field set; the default changed since the
+    console shipped)."""
     payload = {
         "model": "deepseek-v4-pro",
         "messages": messages,
@@ -535,7 +537,14 @@ def call_deepseek(messages, tools=None, deadline=240, max_tokens=600, reasoning=
         "max_tokens": max_tokens,
         "stream": True,
     }
-    if not reasoning:
+    if reasoning:
+        # reasoning on, explicitly — deepseek stopped emitting
+        # reasoning_content without the thinking field (the oct 17 console
+        # relied on the default, and the default changed).
+        # {"type": "enabled"} runs the default full effort — the console's
+        # "max reasoning" pin, kevin's oct 17 ask.
+        payload["thinking"] = {"type": "enabled"}
+    else:
         # reasoning off for voice: latency + talking-speed replies.
         # same wire format nanobot uses for reasoningEffort none on deepseek.
         payload["thinking"] = {"type": "disabled"}
